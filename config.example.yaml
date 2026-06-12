@@ -1,0 +1,56 @@
+# Proxy Jail Configuration
+# Place this file at /etc/proxy-jail/config.yaml
+
+jails:
+  - name: work
+    proxy:
+      host: "127.0.0.1"
+      port: 1080
+      type: socks5
+      # Optional authentication
+      # auth:
+      #   username: "user"
+      #   password: "pass"
+
+    # Optional: specify subnet (auto-assigned if not set)
+    # subnet: "10.10.0.0/24"
+
+    # Applications to run in this jail
+    apps:
+      - command: firefox
+        display_name: "Firefox (Work)"
+        desktop_file: firefox.desktop
+
+      - command: chromium
+        display_name: "Chromium (Work)"
+        desktop_file: chromium.desktop
+
+  - name: gaming
+    proxy:
+      host: "proxy.example.com"
+      port: 1080
+      type: socks5
+
+    apps:
+      - command: steam
+        display_name: "Steam (Proxied)"
+        desktop_file: steam.desktop
+
+# Example usage:
+# 1. Create a jail:
+#    proxy-jail jail create work --socks5 127.0.0.1:1080
+#
+# 2. Run an application:
+#    proxy-jail app run work -- firefox
+#
+# 3. Install desktop entry:
+#    proxy-jail app desktop install work firefox
+#
+# 4. List jails:
+#    proxy-jail jail list
+#
+# 5. Stop a jail:
+#    proxy-jail jail stop work
+#
+# 6. Delete a jail:
+#    proxy-jail jail delete work

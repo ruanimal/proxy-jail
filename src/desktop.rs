@@ -1,0 +1,242 @@
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tracing::{debug, info};
+
+use crate::config::{AppConfig, JailConfig};
+
+/// System .desktop files directory
+const SYSTEM_DESKTOP_DIR: &str = "/usr/share/applications";
+
+/// User .desktop files directory
+const USER_DESKTOP_DIR: &str = ".local/share/applications";
+
+/// Install a .desktop file for an application in a jail
+pub fn desktop_install(jail: &JailConfig, app: &AppConfig) -> Result<()> {
+    let desktop_file = app.desktop_file.as_ref()
+        .context("No desktop file specified for application")?;
+
+    info!("Installing .desktop file for {} in jail {}", app.command, jail.name);
+
+    // Find the source .desktop file
+    let source_path = find_desktop_file(desktop_file)?;
+    debug!("Found source .desktop file: {:?}", source_path);
+
+    // Parse the source .desktop file
+    let desktop_entry = parse_desktop_file(&source_path)?;
+
+    // Generate the modified .desktop file
+    let target_name = format!("pj-{}-{}.desktop", jail.name, app.command);
+    let target_path = user_desktop_dir()?.join(&target_name);
+
+    // Get the display name
+    let original_name = desktop_entry.get("Name").cloned().unwrap_or_default();
+    let display_name = app.get_display_name(&jail.name);
+
+    // Build the new Exec line
+    let original_exec = desktop_entry.get("Exec").cloned().unwrap_or_default();
+    let new_exec = format!("proxy-jail app run {} -- {}", jail.name, original_exec);
+
+    // Generate the .desktop file content
+    let mut content = String::new();
+    content.push_str("[Desktop Entry]\n");
+    content.push_str(&format!("Name={}\n", display_name));
+    content.push_str(&format!("GenericName={}\n", original_name));
+    content.push_str(&format!("Exec={}\n", new_exec));
+
+    // Copy other fields
+    if let Some(icon) = desktop_entry.get("Icon") {
+        content.push_str(&format!("Icon={}\n", icon));
+    }
+    if let Some(comment) = desktop_entry.get("Comment") {
+        content.push_str(&format!("Comment={} (via proxy-jail)\n", comment));
+    }
+    if let Some(terminal) = desktop_entry.get("Terminal") {
+        content.push_str(&format!("Terminal={}\n", terminal));
+    }
+    if let Some(terminal_val) = desktop_entry.get("Terminal") {
+        content.push_str(&format!("Terminal={}\n", terminal_val));
+    }
+    if let Some(type_val) = desktop_entry.get("Type") {
+        content.push_str(&format!("Type={}\n", type_val));
+    } else {
+        content.push_str("Type=Application\n");
+    }
+    if let Some(categories) = desktop_entry.get("Categories") {
+        content.push_str(&format!("Categories={}\n", categories));
+    }
+    if let Some(mimetype) = desktop_entry.get("MimeType") {
+        content.push_str(&format!("MimeType={}\n", mimetype));
+    }
+    if let Some(startup_wm_class) = desktop_entry.get("StartupWMClass") {
+        content.push_str(&format!("StartupWMClass={}\n", startup_wm_class));
+    }
+
+    // Add proxy-jail marker
+    content.push_str(&format!("X-Proxy-Jail={}\n", jail.name));
+    content.push_str(&format!("X-Proxy-Jail-Original={}\n", desktop_file));
+
+    // Write the .desktop file
+    fs::write(&target_path, content)
+        .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
+
+    info!("Installed .desktop file: {:?}", target_path);
+    Ok(())
+}
+
+/// Uninstall a .desktop file for an application in a jail
+pub fn desktop_uninstall(jail: &JailConfig, app: &AppConfig) -> Result<()> {
+    let target_name = format!("pj-{}-{}.desktop", jail.name, app.command);
+    let target_path = user_desktop_dir()?.join(&target_name);
+
+    if target_path.exists() {
+        fs::remove_file(&target_path)
+            .with_context(|| format!("Failed to remove .desktop file: {:?}", target_path))?;
+        info!("Removed .desktop file: {:?}", target_path);
+    } else {
+        debug!("Desktop file not found: {:?}", target_path);
+    }
+
+    Ok(())
+}
+
+/// Find a .desktop file in system directories
+fn find_desktop_file(name: &str) -> Result<PathBuf> {
+    // If it's already a full path, use it
+    let path = Path::new(name);
+    if path.is_absolute() && path.exists() {
+        return Ok(path.to_path_buf());
+    }
+
+    // Add .desktop extension if not present
+    let filename = if name.ends_with(".desktop") {
+        name.to_string()
+    } else {
+        format!("{}.desktop", name)
+    };
+
+    // Search in system directories
+    let search_dirs = vec![
+        PathBuf::from(SYSTEM_DESKTOP_DIR),
+        user_desktop_dir()?,
+    ];
+
+    for dir in search_dirs {
+        let path = dir.join(&filename);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    anyhow::bail!("Desktop file not found: {}", name)
+}
+
+/// Parse a .desktop file into a HashMap
+fn parse_desktop_file(path: &Path) -> Result<HashMap<String, String>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read .desktop file: {:?}", path))?;
+
+    let mut entries = HashMap::new();
+    let mut in_desktop_entry = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Check for section headers
+        if line.starts_with('[') && line.ends_with(']') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+
+        // Parse key=value pairs
+        if in_desktop_entry {
+            if let Some((key, value)) = line.split_once('=') {
+                entries.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Get the user's .desktop directory
+fn user_desktop_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .context("HOME environment variable not set")?;
+    let dir = PathBuf::from(home).join(USER_DESKTOP_DIR);
+
+    // Create directory if it doesn't exist
+    if !dir.exists() {
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create .desktop directory: {:?}", dir))?;
+    }
+
+    Ok(dir)
+}
+
+/// List installed proxy-jail .desktop files
+pub fn list_desktop_files(jail_name: Option<&str>) -> Result<Vec<PathBuf>> {
+    let dir = user_desktop_dir()?;
+    let mut files = Vec::new();
+
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.extension().map_or(false, |ext| ext == "desktop") {
+                let filename = path.file_name().unwrap().to_string_lossy();
+
+                match jail_name {
+                    Some(jail) => {
+                        if filename.starts_with(&format!("pj-{}-", jail)) {
+                            files.push(path);
+                        }
+                    }
+                    None => {
+                        if filename.starts_with("pj-") {
+                            files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_desktop_file() {
+        let content = r#"[Desktop Entry]
+Name=Firefox
+Exec=firefox %u
+Icon=firefox
+Type=Application
+Categories=Network;WebBrowser;
+"#;
+
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("test.desktop");
+        fs::write(&temp_file, content).unwrap();
+
+        let entries = parse_desktop_file(&temp_file).unwrap();
+        assert_eq!(entries.get("Name").unwrap(), "Firefox");
+        assert_eq!(entries.get("Exec").unwrap(), "firefox %u");
+        assert_eq!(entries.get("Icon").unwrap(), "firefox");
+        assert_eq!(entries.get("Type").unwrap(), "Application");
+
+        // Clean up
+        fs::remove_file(&temp_file).unwrap();
+    }
+}
