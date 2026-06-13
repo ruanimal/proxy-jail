@@ -10,14 +10,16 @@ pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<(
 
     info!("Launching application in namespace {}: {} {}", netns_name, command, args.join(" "));
 
-    // Use nsenter command instead of raw syscall for better compatibility
+    // We're running as root (elevated via sudo), use ip netns exec to enter namespace
+    // su drops privileges to the real user (SUDO_USER)
+    let real_user = env::var("SUDO_USER").unwrap_or_else(|_| env::var("USER").unwrap_or_else(|_| "root".to_string()));
     let mut nsenter_args = vec![
         "netns".to_string(),
         "exec".to_string(),
         netns_name.clone(),
         "su".to_string(),
         "-".to_string(),
-        env::var("USER").unwrap_or_else(|_| "root".to_string()),
+        real_user,
         "-c".to_string(),
     ];
 
@@ -31,7 +33,7 @@ pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<(
 
     debug!("Running: ip {}", nsenter_args.join(" "));
 
-    // Execute the command
+    // Execute the command (we're root, so ip netns exec works directly)
     let status = std::process::Command::new("ip")
         .args(&nsenter_args)
         .status()

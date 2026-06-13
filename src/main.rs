@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -88,19 +88,19 @@ enum AppCommands {
 
 #[derive(Subcommand)]
 enum DesktopCommands {
-    /// Install a desktop entry
+    /// Install a desktop entry from a .desktop file
     Install {
         /// Jail name
         jail: String,
-        /// Application command
-        app: String,
+        /// Path to .desktop file (or name found in system directories)
+        desktop_file: String,
     },
     /// Uninstall a desktop entry
     Uninstall {
         /// Jail name
         jail: String,
-        /// Application command
-        app: String,
+        /// .desktop file name (e.g. firefox.desktop or pj-xray-firefox.desktop)
+        desktop_file: String,
     },
     /// List installed desktop entries
     List {
@@ -111,6 +111,22 @@ enum DesktopCommands {
 }
 
 fn main() -> Result<()> {
+    // If not running as root, re-exec ourselves via sudo
+    if !nix::unistd::Uid::effective().is_root() {
+        let args: Vec<String> = std::env::args().collect();
+        let exe = std::env::current_exe()
+            .context("Failed to get current executable path")?;
+
+        eprintln!("Elevating privileges via sudo...");
+        let status = std::process::Command::new("sudo")
+            .arg(exe)
+            .args(&args[1..])
+            .status()
+            .context("Failed to execute sudo")?;
+
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
     let cli = Cli::parse();
 
     // Initialize logging
@@ -147,25 +163,17 @@ fn main() -> Result<()> {
                 jail::stop_app(&jail, &app, &config)?;
             }
             AppCommands::Desktop { command } => match command {
-                DesktopCommands::Install { jail, app } => {
+                DesktopCommands::Install { jail, desktop_file } => {
                     let jail_config = config.find_jail(&jail)
                         .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
 
-                    let app_config = jail_config.apps.iter()
-                        .find(|a| a.command == app)
-                        .ok_or_else(|| anyhow::anyhow!("Application '{}' not found in jail '{}'", app, jail))?;
-
-                    desktop::desktop_install(jail_config, app_config)?;
+                    desktop::desktop_install_from_file(jail_config, &desktop_file)?;
                 }
-                DesktopCommands::Uninstall { jail, app } => {
+                DesktopCommands::Uninstall { jail, desktop_file } => {
                     let jail_config = config.find_jail(&jail)
                         .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
 
-                    let app_config = jail_config.apps.iter()
-                        .find(|a| a.command == app)
-                        .ok_or_else(|| anyhow::anyhow!("Application '{}' not found in jail '{}'", app, jail))?;
-
-                    desktop::desktop_uninstall(jail_config, app_config)?;
+                    desktop::desktop_uninstall_from_file(jail_config, &desktop_file)?;
                 }
                 DesktopCommands::List { jail } => {
                     let files = desktop::list_desktop_files(jail.as_deref())?;

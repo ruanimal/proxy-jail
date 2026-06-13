@@ -1,12 +1,34 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use users::os::unix::UserExt;
 
-/// Global configuration path
-pub const CONFIG_PATH: &str = "/etc/proxy-jail/config.yaml";
+/// Resolve the real user's home directory, even when running under sudo.
+/// Under sudo, $HOME=/root but SUDO_UID points to the invoking user.
+pub fn real_home() -> PathBuf {
+    if let Ok(uid) = std::env::var("SUDO_UID") {
+        if let Ok(uid) = uid.parse::<u32>() {
+            if let Some(user) = users::get_user_by_uid(uid) {
+                return user.home_dir().to_path_buf();
+            }
+        }
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"))
+}
 
-/// Runtime directory for PID files and tun2socks configs
-pub const RUNTIME_DIR: &str = "/run/proxy-jail";
+/// Get the configuration file path: ~/.config/proxy-jail/config.yaml
+pub fn config_path() -> PathBuf {
+    real_home()
+        .join(".config")
+        .join("proxy-jail")
+        .join("config.yaml")
+}
+
+/// Get the runtime directory for PID files and tun2socks configs: $XDG_RUNTIME_DIR/proxy-jail
+pub fn runtime_base_dir() -> PathBuf {
+    dirs::runtime_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(format!("proxy-jail-{}", users::get_current_uid())))
+}
 
 /// User data directory for logs and desktop files
 #[allow(dead_code)]
@@ -87,23 +109,23 @@ fn default_proxy_type() -> String {
 impl Config {
     /// Load configuration from file
     pub fn load() -> Result<Self> {
-        let path = Path::new(CONFIG_PATH);
+        let path = config_path();
         if !path.exists() {
             return Ok(Config { jails: Vec::new() });
         }
 
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", CONFIG_PATH))?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file: {:?}", path))?;
 
         let config: Config = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", CONFIG_PATH))?;
+            .with_context(|| format!("Failed to parse config file: {:?}", path))?;
 
         Ok(config)
     }
 
     /// Save configuration to file
     pub fn save(&self) -> Result<()> {
-        let path = Path::new(CONFIG_PATH);
+        let path = config_path();
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
@@ -114,8 +136,8 @@ impl Config {
         let content = serde_yaml::to_string(self)
             .context("Failed to serialize config")?;
 
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write config file: {}", CONFIG_PATH))?;
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write config file: {:?}", path))?;
 
         Ok(())
     }
@@ -159,7 +181,7 @@ impl JailConfig {
 
     /// Get the runtime directory for this jail
     pub fn runtime_dir(&self) -> PathBuf {
-        PathBuf::from(RUNTIME_DIR).join(&self.name)
+        runtime_base_dir().join(&self.name)
     }
 
     /// Get the tun2socks PID file path
@@ -174,7 +196,7 @@ impl JailConfig {
 
     /// Get the lock file path for concurrent access
     pub fn lock_file(&self) -> PathBuf {
-        PathBuf::from(RUNTIME_DIR).join(format!("{}.lock", self.name))
+        runtime_base_dir().join(format!("{}.lock", self.name))
     }
 
     /// Get the subnet, auto-assign if not specified

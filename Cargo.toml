@@ -19,3 +19,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.29", features = ["process", "signal", "user", "fs", "sched"] }
 users = "0.11"
 libc = "0.2"
+dirs = "6"

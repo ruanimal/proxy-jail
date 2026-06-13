@@ -89,7 +89,6 @@ pub fn generate_tun2socks_config(jail: &JailConfig, subnet: &str) -> Result<()> 
 /// Start tun2socks process in the network namespace
 pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
     let netns_name = jail.netns_name();
-    let config_path = jail.tun2socks_config_file();
     let pid_file = jail.pid_file();
 
     // Check if tun2socks is already running
@@ -98,19 +97,42 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         return Ok(pid);
     }
 
-    // Generate config file
-    generate_tun2socks_config(jail, subnet)?;
-
     // Get gateway for routing
     let gateway = crate::network::get_gateway(subnet)?;
 
-    info!("Starting tun2socks in namespace: {}", netns_name);
+    // If proxy host is localhost/127.0.0.1, use the gateway IP instead.
+    // Inside the namespace, 127.0.0.1 refers to the namespace's own loopback,
+    // not the host's. The gateway IP (host veth) routes to the host where the
+    // proxy actually listens.
+    let effective_proxy_host = if jail.proxy.host == "localhost"
+        || jail.proxy.host == "127.0.0.1"
+        || jail.proxy.host == "::1"
+    {
+        info!(
+            "Proxy host is {}, using gateway {} as proxy address",
+            jail.proxy.host, gateway
+        );
+        gateway.clone()
+    } else {
+        jail.proxy.host.clone()
+    };
 
-    // Start tun2socks as a background process
+    // Build proxy URL
+    let proxy_url = match &jail.proxy.auth {
+        Some(auth) => format!("socks5://{}:{}@{}:{}", auth.username, auth.password, effective_proxy_host, jail.proxy.port),
+        None => format!("socks5://{}:{}", effective_proxy_host, jail.proxy.port),
+    };
+
+    info!("Starting tun2socks in namespace: {} -> {}", netns_name, proxy_url);
+
+    // Start tun2socks using command-line arguments (more reliable than config file)
     let child = Command::new("ip")
         .args(&[
             "netns", "exec", &netns_name,
-            "tun2socks", "-config", config_path.to_str().unwrap(),
+            "tun2socks",
+            "-device", "tun://tun0",
+            "-proxy", &proxy_url,
+            "-loglevel", "info",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -119,21 +141,16 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
 
     let pid = child.id();
 
-    // Wait a bit for tun2socks to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Check if process is still running
-    if !is_process_running(pid)? {
-        anyhow::bail!("tun2socks failed to start");
-    }
+    // Wait for tun0 device to appear (tun2socks needs time to create it)
+    wait_for_device(&netns_name, "tun0", 5000)?;
 
     // Write PID file
     fs::write(&pid_file, pid.to_string())
         .with_context(|| format!("Failed to write PID file: {:?}", pid_file))?;
 
     // Set up routing rules
-    let proxy_host = &jail.proxy.host;
-    crate::network::setup_tun2socks_routing(jail, proxy_host, &gateway)?;
+    // Use effective_proxy_host for routing too (localhost → gateway)
+    crate::network::setup_tun2socks_routing(jail, &effective_proxy_host, &gateway)?;
 
     info!("tun2socks started with PID: {}", pid);
     Ok(pid)
@@ -194,6 +211,37 @@ pub fn stop_tun2socks(jail: &JailConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Wait for a network device to appear in a namespace
+fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let check_interval = std::time::Duration::from_millis(100);
+
+    loop {
+        // Check if device exists in namespace
+        let output = Command::new("ip")
+            .args(&["netns", "exec", netns_name, "ip", "link", "show", device])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                debug!("Device {} appeared in namespace {}", device, netns_name);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "Timeout waiting for device {} to appear in namespace {} ({}ms)",
+                device, netns_name, timeout_ms
+            );
+        }
+
+        std::thread::sleep(check_interval);
+    }
 }
 
 /// Check if a process is running

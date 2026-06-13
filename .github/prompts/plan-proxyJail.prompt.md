@@ -53,8 +53,8 @@ src/
 > 注：tun2socks 模式下不需要 iptables REDIRECT，仅需路由规则。`dns.rs` 也不需要——tun2socks 在 L3 层接管 DNS。两个模块已移除。
 
 **3. 配置模型**
-- 全局配置路径：`/etc/proxy-jail/config.yaml`
-- 运行时目录：`/run/proxy-jail/<jail-name>/`（PID 文件、tun2socks 配置）
+- 全局配置路径：`~/.config/proxy-jail/config.yaml`（遵循 `$XDG_CONFIG_HOME`）
+- 运行时目录：`$XDG_RUNTIME_DIR/proxy-jail/<jail-name>/`（PID 文件、tun2socks 配置，fallback `/tmp/proxy-jail-{uid}/`）
 - 配置结构：全局 `jails` 列表，每个 jail 含 `name`、`proxy`（host/port/type/auth）、`apps`（command/args/display_name）
 
 **4. CLI 命令规划**

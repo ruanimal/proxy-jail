@@ -47,6 +47,16 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     // Set default gateway in namespace
     run_command_in_netns(&netns_name, "ip", &["route", "add", "default", "via", &gateway])?;
 
+    // Set up DNS in namespace (isolated namespace can't reach host's 127.0.0.53)
+    // Copy the host's real DNS server into the namespace's resolv.conf
+    let netns_resolv_dir = format!("/etc/netns/{}", netns_name);
+    std::fs::create_dir_all(&netns_resolv_dir)
+        .with_context(|| format!("Failed to create /etc/netns/{}", netns_name))?;
+    let dns_content = get_host_dns()?;
+    std::fs::write(format!("{}/resolv.conf", netns_resolv_dir), &dns_content)
+        .context("Failed to write namespace resolv.conf")?;
+    debug!("Namespace DNS config:\n{}", dns_content);
+
     // Enable IP forwarding on host
     enable_ip_forward()?;
 
@@ -104,6 +114,10 @@ pub fn destroy_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     // Delete network namespace
     let _ = run_command("ip", &["netns", "delete", &netns_name]);
 
+    // Clean up /etc/netns/ directory
+    let netns_resolv_dir = format!("/etc/netns/{}", netns_name);
+    let _ = std::fs::remove_dir_all(&netns_resolv_dir);
+
     info!("Network namespace {} destroyed", netns_name);
     Ok(())
 }
@@ -116,20 +130,39 @@ pub fn setup_tun2socks_routing(
 ) -> Result<()> {
     let netns_name = jail.netns_name();
 
-    // Add route for proxy host to bypass TUN (go through veth)
-    info!("Adding route for proxy host: {} via {}", proxy_host, gateway);
+    // Bring tun0 up (tun2socks creates it but may not set it to UP state)
+    info!("Bringing tun0 up");
     run_command_in_netns(
         &netns_name,
         "ip",
-        &["route", "add", proxy_host, "via", gateway],
+        &["link", "set", "tun0", "up"],
     )?;
 
-    // Set default route to TUN device
-    info!("Setting default route to tun0");
+    // Resolve hostname to IP (ip route requires IP addresses, not hostnames)
+    let resolved_host = resolve_to_ip(proxy_host)?;
+
+    // Add route for proxy host to bypass TUN (go through veth)
+    // Skip if proxy host is the gateway itself — the connected route on the
+    // veth interface already covers it and won't be affected by the default
+    // route replacement below.
+    if resolved_host != gateway {
+        info!("Adding route for proxy host: {} ({}) via {}", proxy_host, resolved_host, gateway);
+        run_command_in_netns(
+            &netns_name,
+            "ip",
+            &["route", "add", &resolved_host, "via", gateway],
+        )?;
+    } else {
+        debug!("Proxy host {} is the gateway, skipping explicit route", resolved_host);
+    }
+
+    // Replace default route to go through TUN device
+    // (the original default route via veth gateway was set during create_jail_network)
+    info!("Replacing default route to tun0");
     run_command_in_netns(
         &netns_name,
         "ip",
-        &["route", "add", "default", "dev", "tun0"],
+        &["route", "replace", "default", "dev", "tun0"],
     )?;
 
     Ok(())
@@ -139,6 +172,50 @@ pub fn setup_tun2socks_routing(
 pub fn get_gateway(subnet: &str) -> Result<String> {
     let (network_addr, _) = parse_subnet(subnet)?;
     increment_ip(&network_addr, 1)
+}
+
+/// Get the host's real DNS server configuration
+/// Reads from /run/systemd/resolve/resolv.conf (upstream DNS) or falls back to parsing resolvectl
+fn get_host_dns() -> Result<String> {
+    // Try systemd-resolved's upstream resolv.conf first (contains real DNS servers, not 127.0.0.53)
+    let upstream_path = "/run/systemd/resolve/resolv.conf";
+    if let Ok(content) = std::fs::read_to_string(upstream_path) {
+        // Filter out 127.0.0.53 (stub) and keep real nameservers
+        let filtered: String = content.lines()
+            .filter(|line| {
+                if line.starts_with("nameserver") {
+                    let server = line.split_whitespace().nth(1).unwrap_or("");
+                    server != "127.0.0.53"
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if filtered.contains("nameserver") {
+            return Ok(filtered + "\n");
+        }
+    }
+
+    // Fallback: parse /etc/resolv.conf (skip 127.0.0.53)
+    if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+        let filtered: String = content.lines()
+            .filter(|line| {
+                if line.starts_with("nameserver") {
+                    let server = line.split_whitespace().nth(1).unwrap_or("");
+                    server != "127.0.0.53"
+                } else {
+                    !line.is_empty()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if filtered.contains("nameserver") {
+            return Ok(filtered + "\n");
+        }
+    }
+
+    anyhow::bail!("Failed to detect host DNS server")
 }
 
 /// Enable IP forwarding on the host
@@ -195,6 +272,24 @@ fn run_command_in_netns(netns: &str, program: &str, args: &[&str]) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Resolve a hostname to an IP address
+fn resolve_to_ip(host: &str) -> Result<String> {
+    // Already an IP address?
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(host.to_string());
+    }
+
+    // Resolve via DNS
+    use std::net::ToSocketAddrs;
+    let addr = format!("{}:0", host);
+    let mut addrs = addr.to_socket_addrs()
+        .with_context(|| format!("Failed to resolve hostname: {}", host))?;
+
+    addrs.next()
+        .map(|a| a.ip().to_string())
+        .ok_or_else(|| anyhow::anyhow!("No addresses found for hostname: {}", host))
 }
 
 /// Parse a subnet string (e.g., "10.10.0.0/24") into network address and prefix length

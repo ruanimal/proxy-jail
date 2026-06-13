@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 use crate::config::{AppConfig, JailConfig};
+use crate::config::real_home;
 
 /// System .desktop files directory
 const SYSTEM_DESKTOP_DIR: &str = "/usr/share/applications";
@@ -101,6 +102,41 @@ pub fn desktop_uninstall(jail: &JailConfig, app: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Uninstall a .desktop file by its original name or the generated name
+pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Result<()> {
+    let dir = user_desktop_dir()?;
+
+    // Try matching by original source name: pj-{jail}-{command}.desktop
+    // Derive command from desktop_name: strip path and .desktop suffix
+    let stem = Path::new(desktop_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| desktop_name.to_string());
+
+    // Try the generated name pattern first: pj-{jail}-{stem}.desktop
+    let generated_name = format!("pj-{}-{}.desktop", jail.name, stem);
+    let generated_path = dir.join(&generated_name);
+    if generated_path.exists() {
+        fs::remove_file(&generated_path)
+            .with_context(|| format!("Failed to remove .desktop file: {:?}", generated_path))?;
+        info!("Removed .desktop file: {:?}", generated_path);
+        println!("Removed: {:?}", generated_path);
+        return Ok(());
+    }
+
+    // If the user passed the full generated filename directly
+    let direct_path = dir.join(desktop_name);
+    if direct_path.exists() {
+        fs::remove_file(&direct_path)
+            .with_context(|| format!("Failed to remove .desktop file: {:?}", direct_path))?;
+        info!("Removed .desktop file: {:?}", direct_path);
+        println!("Removed: {:?}", direct_path);
+        return Ok(());
+    }
+
+    anyhow::bail!("Desktop file not found for '{}' in jail '{}'", desktop_name, jail.name);
+}
+
 /// Find a .desktop file in system directories
 fn find_desktop_file(name: &str) -> Result<PathBuf> {
     // If it's already a full path, use it
@@ -167,9 +203,7 @@ fn parse_desktop_file(path: &Path) -> Result<HashMap<String, String>> {
 
 /// Get the user's .desktop directory
 fn user_desktop_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .context("HOME environment variable not set")?;
-    let dir = PathBuf::from(home).join(USER_DESKTOP_DIR);
+    let dir = real_home().join(USER_DESKTOP_DIR);
 
     // Create directory if it doesn't exist
     if !dir.exists() {
@@ -178,6 +212,75 @@ fn user_desktop_dir() -> Result<PathBuf> {
     }
 
     Ok(dir)
+}
+
+/// Install a .desktop file for an application in a jail, directly from a .desktop file path
+pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Result<()> {
+    let source_path = find_desktop_file(desktop_path)?;
+    info!("Installing .desktop file from {:?} in jail {}", source_path, jail.name);
+
+    let desktop_entry = parse_desktop_file(&source_path)?;
+
+    // Extract command from Exec field
+    let original_exec = desktop_entry.get("Exec").cloned()
+        .context("No Exec field found in .desktop file")?;
+
+    // Use the source .desktop filename stem as the command identifier
+    let exec_cmd = source_path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            original_exec.split_whitespace()
+                .next()
+                .unwrap_or(&original_exec)
+                .to_string()
+        });
+
+    let original_name = desktop_entry.get("Name").cloned().unwrap_or_else(|| exec_cmd.clone());
+    let target_name = format!("pj-{}-{}.desktop", jail.name, exec_cmd);
+    let target_path = user_desktop_dir()?.join(&target_name);
+
+    let display_name = format!("{} (jail: {})", original_name, jail.name);
+    let new_exec = format!("proxy-jail app run {} -- {}", jail.name, original_exec);
+
+    let mut content = String::new();
+    content.push_str("[Desktop Entry]\n");
+    content.push_str(&format!("Name={}\n", display_name));
+    content.push_str(&format!("GenericName={}\n", original_name));
+    content.push_str(&format!("Exec={}\n", new_exec));
+
+    if let Some(icon) = desktop_entry.get("Icon") {
+        content.push_str(&format!("Icon={}\n", icon));
+    }
+    if let Some(comment) = desktop_entry.get("Comment") {
+        content.push_str(&format!("Comment={} (via proxy-jail)\n", comment));
+    }
+    if let Some(terminal) = desktop_entry.get("Terminal") {
+        content.push_str(&format!("Terminal={}\n", terminal));
+    }
+    if let Some(type_val) = desktop_entry.get("Type") {
+        content.push_str(&format!("Type={}\n", type_val));
+    } else {
+        content.push_str("Type=Application\n");
+    }
+    if let Some(categories) = desktop_entry.get("Categories") {
+        content.push_str(&format!("Categories={}\n", categories));
+    }
+    if let Some(mimetype) = desktop_entry.get("MimeType") {
+        content.push_str(&format!("MimeType={}\n", mimetype));
+    }
+    if let Some(startup_wm_class) = desktop_entry.get("StartupWMClass") {
+        content.push_str(&format!("StartupWMClass={}\n", startup_wm_class));
+    }
+
+    content.push_str(&format!("X-Proxy-Jail={}\n", jail.name));
+    content.push_str(&format!("X-Proxy-Jail-Original={}\n", source_path.display()));
+
+    fs::write(&target_path, &content)
+        .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
+
+    info!("Installed .desktop file: {:?}", target_path);
+    println!("Installed: {:?}", target_path);
+    Ok(())
 }
 
 /// List installed proxy-jail .desktop files

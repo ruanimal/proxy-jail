@@ -7,7 +7,7 @@ Force GUI applications through SOCKS5 proxy using Linux network namespaces and t
 Proxy Jail creates isolated network environments for your applications using Linux network namespaces. All traffic from the jailed application is transparently routed through a SOCKS5 proxy, providing:
 
 - **Complete traffic isolation** - All TCP/UDP/DNS traffic goes through the proxy
-- **No root required** - Uses file capabilities instead of sudo
+- **No root required** - Uses file capabilities instead of sudo, config stored in user directories
 - **Transparent to applications** - Apps work normally without configuration
 - **Desktop integration** - Generates .desktop files for seamless launching
 
@@ -48,17 +48,20 @@ cargo build --release
 sudo cp target/release/proxy-jail /usr/local/bin/
 ```
 
-### 3. Set capabilities
+### 3. Configure passwordless sudo
+
+proxy-jail automatically elevates privileges via sudo when needed. Configure a sudoers rule so you won't be prompted for a password:
 
 ```bash
-sudo setcap cap_net_admin,cap_sys_admin,cap_setuid,cap_setgid+ep /usr/local/bin/proxy-jail
-sudo setcap cap_net_admin+ep /path/to/tun2socks
+echo "$USER ALL=(root) NOPASSWD: /usr/local/bin/proxy-jail" | sudo tee /etc/sudoers.d/proxy-jail
+sudo chmod 440 /etc/sudoers.d/proxy-jail
 ```
 
-### 4. Create configuration directory
+> **Note**: Only `proxy-jail` itself is allowed via sudoers. Individual `ip`, `iptables` commands are not exposed — they run internally within proxy-jail after privilege elevation.
 
+The `tun2socks` binary also needs capabilities:
 ```bash
-sudo mkdir -p /etc/proxy-jail
+sudo setcap cap_net_admin+ep /path/to/tun2socks
 ```
 
 ## Usage
@@ -101,7 +104,7 @@ proxy-jail jail delete work
 
 ## Configuration
 
-Configuration is stored at `/etc/proxy-jail/config.yaml`. See `config.example.yaml` for the format.
+Configuration is stored at `~/.config/proxy-jail/config.yaml` (respects `$XDG_CONFIG_HOME`). See `config.example.yaml` for the format.
 
 ### Example configuration
 
@@ -129,7 +132,8 @@ jails:
 
 ## Security considerations
 
-- The binary requires `cap_net_admin,cap_sys_admin,cap_setuid,cap_setgid` capabilities
+- Privileged operations use sudo with a scoped sudoers rule (no full root access)
+- Configuration and runtime files are stored in user directories (`~/.config/proxy-jail/`, `$XDG_RUNTIME_DIR/proxy-jail/`)
 - Applications run with dropped privileges (actual user, not root)
 - Network isolation is complete - no traffic leaks outside the proxy
 - DNS queries are also proxied (no DNS leaks)
