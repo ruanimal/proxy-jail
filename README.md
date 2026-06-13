@@ -115,10 +115,7 @@ jails:
       host: "127.0.0.1"
       port: 1080
       type: socks5
-    apps:
-      - command: firefox
-        display_name: "Firefox (Work)"
-        desktop_file: firefox.desktop
+
 ```
 
 ## How it works

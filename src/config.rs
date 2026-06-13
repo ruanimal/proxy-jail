@@ -50,10 +50,6 @@ pub struct JailConfig {
     /// SOCKS5 proxy configuration
     pub proxy: ProxyConfig,
 
-    /// Applications configured for this jail
-    #[serde(default)]
-    pub apps: Vec<AppConfig>,
-
     /// Subnet for the jail network (e.g., "10.10.0.0/24")
     /// If not specified, auto-assigned
     #[serde(default)]
@@ -83,23 +79,6 @@ pub struct ProxyConfig {
 pub struct ProxyAuth {
     pub username: String,
     pub password: String,
-}
-
-/// Application configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppConfig {
-    /// Command to execute
-    pub command: String,
-
-    /// Arguments for the command
-    #[serde(default)]
-    pub args: Vec<String>,
-
-    /// Display name for .desktop file
-    pub display_name: Option<String>,
-
-    /// Source .desktop file name (e.g., "firefox.desktop")
-    pub desktop_file: Option<String>,
 }
 
 fn default_proxy_type() -> String {
@@ -189,10 +168,7 @@ impl JailConfig {
         self.runtime_dir().join("tun2socks.pid")
     }
 
-    /// Get the tun2socks config file path
-    pub fn tun2socks_config_file(&self) -> PathBuf {
-        self.runtime_dir().join("tun2socks.json")
-    }
+
 
     /// Get the lock file path for concurrent access
     pub fn lock_file(&self) -> PathBuf {
@@ -249,26 +225,6 @@ impl ProxyConfig {
     }
 }
 
-impl AppConfig {
-    /// Get the full command with arguments
-    #[allow(dead_code)]
-    pub fn full_command(&self) -> String {
-        if self.args.is_empty() {
-            self.command.clone()
-        } else {
-            format!("{} {}", self.command, self.args.join(" "))
-        }
-    }
-
-    /// Get the display name for .desktop file
-    pub fn get_display_name(&self, jail_name: &str) -> String {
-        match &self.display_name {
-            Some(name) => format!("{} (via proxy-jail: {})", name, jail_name),
-            None => format!("{} (via proxy-jail: {})", self.command, jail_name),
-        }
-    }
-}
-
 /// Get the user's data directory
 #[allow(dead_code)]
 pub fn user_data_dir() -> Result<PathBuf> {
@@ -298,12 +254,6 @@ mod tests {
                     proxy_type: "socks5".to_string(),
                     auth: None,
                 },
-                apps: vec![AppConfig {
-                    command: "firefox".to_string(),
-                    args: vec![],
-                    display_name: None,
-                    desktop_file: None,
-                }],
                 subnet: None,
             }],
         };
@@ -324,7 +274,6 @@ mod tests {
                 proxy_type: "socks5".to_string(),
                 auth: None,
             },
-            apps: vec![],
             subnet: None,
         };
 
@@ -339,7 +288,6 @@ mod tests {
                 proxy_type: "socks5".to_string(),
                 auth: None,
             },
-            apps: vec![],
             subnet: Some("10.10.0.0/24".to_string()),
         }];
         assert_eq!(jail.get_subnet(&existing), "10.10.1.0/24");
@@ -355,7 +303,6 @@ mod tests {
                 proxy_type: "socks5".to_string(),
                 auth: None,
             },
-            apps: vec![],
             subnet: None,
         };
 

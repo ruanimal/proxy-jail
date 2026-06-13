@@ -3,7 +3,7 @@ use nix::fcntl::{Flock, FlockArg};
 use std::fs::{self, File};
 use tracing::{debug, info, warn};
 
-use crate::config::{AppConfig, Config, JailConfig};
+use crate::config::{Config, JailConfig};
 use crate::network;
 use crate::proxy;
 
@@ -23,7 +23,6 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
             proxy_type: "socks5".to_string(),
             auth: None,
         },
-        apps: Vec::new(),
         subnet: None,
     };
 
@@ -43,8 +42,8 @@ pub fn list_jails(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<15} {:<20} {:<15} {:<10}", "NAME", "PROXY", "STATUS", "APPS");
-    println!("{:-<15} {:-<20} {:-<15} {:-<10}", "", "", "", "");
+    println!("{:<15} {:<20} {:<15}", "NAME", "PROXY", "STATUS");
+    println!("{:-<15} {:-<20} {:-<15}", "", "", "");
 
     for jail in &config.jails {
         let status = if network::netns_exists(&jail.netns_name()) {
@@ -57,14 +56,12 @@ pub fn list_jails(config: &Config) -> Result<()> {
             "Stopped"
         };
 
-        let apps_count = jail.apps.len();
         let proxy_addr = jail.proxy.socks5_addr();
 
-        println!("{:<15} {:<20} {:<15} {:<10}",
+        println!("{:<15} {:<20} {:<15}",
             jail.name,
             proxy_addr,
-            status,
-            apps_count
+            status
         );
     }
 
@@ -244,56 +241,6 @@ fn parse_socks5_addr(addr: &str) -> Result<(String, u16)> {
         .with_context(|| format!("Invalid port number: {}", parts[1]))?;
 
     Ok((host, port))
-}
-
-/// Add an application to a jail
-#[allow(dead_code)]
-pub fn add_app(
-    jail_name: &str,
-    command: &str,
-    args: Vec<String>,
-    display_name: Option<String>,
-    desktop_file: Option<String>,
-    config: &mut Config,
-) -> Result<()> {
-    let jail = config.find_jail_mut(jail_name)
-        .with_context(|| format!("Jail '{}' not found", jail_name))?;
-
-    let app = AppConfig {
-        command: command.to_string(),
-        args,
-        display_name,
-        desktop_file,
-    };
-
-    jail.apps.push(app);
-    config.save()?;
-
-    info!("Application '{}' added to jail '{}'", command, jail_name);
-    Ok(())
-}
-
-/// Remove an application from a jail
-#[allow(dead_code)]
-pub fn remove_app(
-    jail_name: &str,
-    command: &str,
-    config: &mut Config,
-) -> Result<()> {
-    let jail = config.find_jail_mut(jail_name)
-        .with_context(|| format!("Jail '{}' not found", jail_name))?;
-
-    let initial_len = jail.apps.len();
-    jail.apps.retain(|a| a.command != command);
-
-    if jail.apps.len() == initial_len {
-        anyhow::bail!("Application '{}' not found in jail '{}'", command, jail_name);
-    }
-
-    config.save()?;
-
-    info!("Application '{}' removed from jail '{}'", command, jail_name);
-    Ok(())
 }
 
 #[cfg(test)]

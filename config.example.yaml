@@ -15,15 +15,7 @@ jails:
     # Optional: specify subnet (auto-assigned if not set)
     # subnet: "10.10.0.0/24"
 
-    # Applications to run in this jail
-    apps:
-      - command: firefox
-        display_name: "Firefox (Work)"
-        desktop_file: firefox.desktop
 
-      - command: chromium
-        display_name: "Chromium (Work)"
-        desktop_file: chromium.desktop
 
   - name: gaming
     proxy:
@@ -31,10 +23,7 @@ jails:
       port: 1080
       type: socks5
 
-    apps:
-      - command: steam
-        display_name: "Steam (Proxied)"
-        desktop_file: steam.desktop
+
 
 # Example usage:
 # 1. Create a jail:

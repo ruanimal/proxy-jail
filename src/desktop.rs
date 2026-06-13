@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::info;
 
-use crate::config::{AppConfig, JailConfig};
+use crate::config::JailConfig;
 use crate::config::real_home;
 
 /// System .desktop files directory
@@ -12,95 +12,6 @@ const SYSTEM_DESKTOP_DIR: &str = "/usr/share/applications";
 
 /// User .desktop files directory
 const USER_DESKTOP_DIR: &str = ".local/share/applications";
-
-/// Install a .desktop file for an application in a jail
-pub fn desktop_install(jail: &JailConfig, app: &AppConfig) -> Result<()> {
-    let desktop_file = app.desktop_file.as_ref()
-        .context("No desktop file specified for application")?;
-
-    info!("Installing .desktop file for {} in jail {}", app.command, jail.name);
-
-    // Find the source .desktop file
-    let source_path = find_desktop_file(desktop_file)?;
-    debug!("Found source .desktop file: {:?}", source_path);
-
-    // Parse the source .desktop file
-    let desktop_entry = parse_desktop_file(&source_path)?;
-
-    // Generate the modified .desktop file
-    let target_name = format!("pj-{}-{}.desktop", jail.name, app.command);
-    let target_path = user_desktop_dir()?.join(&target_name);
-
-    // Get the display name
-    let original_name = desktop_entry.get("Name").cloned().unwrap_or_default();
-    let display_name = app.get_display_name(&jail.name);
-
-    // Build the new Exec line
-    let original_exec = desktop_entry.get("Exec").cloned().unwrap_or_default();
-    let new_exec = format!("proxy-jail app run {} -- {}", jail.name, original_exec);
-
-    // Generate the .desktop file content
-    let mut content = String::new();
-    content.push_str("[Desktop Entry]\n");
-    content.push_str(&format!("Name={}\n", display_name));
-    content.push_str(&format!("GenericName={}\n", original_name));
-    content.push_str(&format!("Exec={}\n", new_exec));
-
-    // Copy other fields
-    if let Some(icon) = desktop_entry.get("Icon") {
-        content.push_str(&format!("Icon={}\n", icon));
-    }
-    if let Some(comment) = desktop_entry.get("Comment") {
-        content.push_str(&format!("Comment={} (via proxy-jail)\n", comment));
-    }
-    if let Some(terminal) = desktop_entry.get("Terminal") {
-        content.push_str(&format!("Terminal={}\n", terminal));
-    }
-    if let Some(terminal_val) = desktop_entry.get("Terminal") {
-        content.push_str(&format!("Terminal={}\n", terminal_val));
-    }
-    if let Some(type_val) = desktop_entry.get("Type") {
-        content.push_str(&format!("Type={}\n", type_val));
-    } else {
-        content.push_str("Type=Application\n");
-    }
-    if let Some(categories) = desktop_entry.get("Categories") {
-        content.push_str(&format!("Categories={}\n", categories));
-    }
-    if let Some(mimetype) = desktop_entry.get("MimeType") {
-        content.push_str(&format!("MimeType={}\n", mimetype));
-    }
-    if let Some(startup_wm_class) = desktop_entry.get("StartupWMClass") {
-        content.push_str(&format!("StartupWMClass={}\n", startup_wm_class));
-    }
-
-    // Add proxy-jail marker
-    content.push_str(&format!("X-Proxy-Jail={}\n", jail.name));
-    content.push_str(&format!("X-Proxy-Jail-Original={}\n", desktop_file));
-
-    // Write the .desktop file
-    fs::write(&target_path, content)
-        .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
-
-    info!("Installed .desktop file: {:?}", target_path);
-    Ok(())
-}
-
-/// Uninstall a .desktop file for an application in a jail
-pub fn desktop_uninstall(jail: &JailConfig, app: &AppConfig) -> Result<()> {
-    let target_name = format!("pj-{}-{}.desktop", jail.name, app.command);
-    let target_path = user_desktop_dir()?.join(&target_name);
-
-    if target_path.exists() {
-        fs::remove_file(&target_path)
-            .with_context(|| format!("Failed to remove .desktop file: {:?}", target_path))?;
-        info!("Removed .desktop file: {:?}", target_path);
-    } else {
-        debug!("Desktop file not found: {:?}", target_path);
-    }
-
-    Ok(())
-}
 
 /// Uninstall a .desktop file by its original name or the generated name
 pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Result<()> {
