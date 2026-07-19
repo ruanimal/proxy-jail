@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use nix::unistd::{Uid, User};
 use std::env;
+use std::path::PathBuf;
 use std::process::Child;
 use tracing::{debug, info};
 
@@ -30,6 +32,16 @@ pub struct AppHandle {
 /// 2. Call `child.wait()` (or `child.wait_with_output()`) to reap it
 ///    and forward the exit status.
 ///
+/// # Privileges and environment
+///
+/// This function runs in the **root** context (the unprivileged parent
+/// re-exec'd via `sudo -E`, see `main.rs`).  We then `setpriv` back to
+/// the real user so the GUI process owns its `~/.config`, DBus socket,
+/// Xauthority, etc.  Because sudo invoked us with `-E`, the inherited
+/// environment already contains DISPLAY / XAUTHORITY /
+/// DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR / etc. — we do **not**
+/// re-construct it from a temp file.
+///
 /// # Prerequisites
 ///
 /// Caller must guarantee the netns `pj-{name}` exists and that
@@ -44,61 +56,75 @@ pub fn spawn_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<Ap
         args.join(" ")
     );
 
-    // Determine the real user from SUDO_USER (set automatically by sudo).
-    let real_user = env::var("SUDO_USER")
-        .or_else(|_| env::var("USER"))
-        .unwrap_or_else(|_| "root".to_string());
+    // Locate setpriv.  util-linux has shipped it since 2.23 (2014);
+    // every mainstream Linux distro has it.  Fail fast with a clear
+    // error if absent.
+    let setpriv = which_setpriv()?;
 
-    // Path to the environment file saved before sudo re-exec.
-    // SUDO_UID is set automatically by sudo — we use it to locate the
-    // temp file written by the unprivileged parent process.
-    let env_file = match env::var("SUDO_UID") {
-        Ok(uid) => format!("/tmp/pj-env-{}", uid),
-        Err(_) => format!("/tmp/pj-env-{}", nix::unistd::Uid::current().as_raw()),
-    };
-
-    // Build the command that runs inside the namespace.
-    // `su -s /bin/bash` runs a bash shell as the target user.
-    // The `-c` argument sources the saved environment, then execs the app.
-    // Using `exec` replaces the shell so signals reach the app directly.
-    let raw_command = if args.is_empty() {
-        format!("exec {}", command)
+    // Resolve the real user.
+    //
+    // SUDO_USER is set by sudo to the invoking user.  If we are already
+    // root (e.g. running the binary from a root shell for tests), fall
+    // back to USER, then to the current uid as a last resort.
+    let real_user_name = env::var("SUDO_USER")
+        .ok()
+        .or_else(|| env::var("USER").ok())
+        .unwrap_or_default();
+    let real_user = if real_user_name.is_empty() {
+        User::from_uid(Uid::current())
+            .ok()
+            .flatten()
+            .with_context(|| format!("Cannot resolve current uid {:?}", Uid::current()))?
     } else {
-        // Join args, escaping each for shell safety
-        let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
-        format!("exec {} {}", command, escaped_args.join(" "))
+        User::from_name(&real_user_name)
+            .with_context(|| format!("Cannot resolve user {:?}", real_user_name))?
+            .with_context(|| format!("User {:?} does not exist", real_user_name))?
     };
+    let real_uid = real_user.uid.as_raw();
+    let real_gid = real_user.gid.as_raw();
 
-    // Source the environment file (if it exists) and run the command.
-    // `su -s /bin/bash` instead of `su -` avoids a login shell that would
-    // overwrite the sourced environment with /etc/profile defaults.
-    let shell_cmd = format!(
-        "test -f '{}' && . '{}' ; {}",
-        env_file, env_file, raw_command
-    );
-
-    let nsenter_args = vec![
-        "netns".to_string(),
-        "exec".to_string(),
+    // Build the argv that runs as our final child.
+    //
+    // `ip netns exec <name> setpriv --reuid=UID --regid=GID --clear-groups -- <cmd> <args>...`
+    //
+    // `--clear-groups` drops supplementary groups so the user process
+    // does not inherit any group memberships we (root) might have.  The
+    // leading `ip netns exec` does the namespace jump; setpriv drops
+    // privileges; the user's command runs as that user.
+    let mut nsenter_args: Vec<String> = vec![
+        "netns".into(),
+        "exec".into(),
         netns_name.clone(),
-        "su".to_string(),
-        "-s".to_string(),
-        "/bin/bash".to_string(),
-        real_user,
-        "-c".to_string(),
-        shell_cmd,
+        setpriv.to_string_lossy().into_owned(),
+        format!("--reuid={}", real_uid),
+        format!("--regid={}", real_gid),
+        "--clear-groups".into(),
     ];
+    nsenter_args.push(command.to_string());
+    for a in args {
+        nsenter_args.push(a.clone());
+    }
 
     debug!("Running: ip {}", nsenter_args.join(" "));
 
-    // Spawn (do NOT wait — we want the child to outlive this function
-    // call so the caller can register it).  We are root at this point
-    // (the unprivileged parent re-exec'd via sudo), so `ip netns exec`
-    // works directly without a nested `sudo`.
+    // Spawn `ip netns exec ...` and let the kernel take it from there.
+    // Because `ip netns exec` re-execs into the user command (it does
+    // not fork), `child.id()` is the real user pid and `child.wait()`
+    // reaps it directly.
     let child = std::process::Command::new("ip")
         .args(&nsenter_args)
         .spawn()
-        .context("Failed to spawn command in namespace")?;
+        .with_context(|| {
+            format!(
+                "Failed to spawn `ip netns exec ... setpriv ... {}{}`",
+                command,
+                if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", args.join(" "))
+                },
+            )
+        })?;
 
     let app_name = std::path::Path::new(command)
         .file_name()
@@ -137,17 +163,24 @@ pub fn wait_app(handle: &mut AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Escape a string for safe use in a shell command.
-fn shell_escape(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
+/// Locate the `setpriv` binary on $PATH.
+///
+/// We do this once at startup (in `spawn_app`) rather than relying on
+/// a hard-coded `/usr/sbin/setpriv` so the binary works on minimal
+/// installs (Alpine, containers) where the path differs.
+fn which_setpriv() -> Result<PathBuf> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join("setpriv");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
     }
-    // If it only contains safe characters, return as-is
-    if s.chars().all(|c| c.is_alphanumeric() || "-_./=@:,+~".contains(c)) {
-        return s.to_string();
-    }
-    // Otherwise, wrap in single quotes with internal quotes escaped
-    format!("'{}'", s.replace('\'', "'\\''"))
+    anyhow::bail!(
+        "`setpriv` (from util-linux) is required but was not found on $PATH. \
+         Install it via your package manager (`apt install util-linux`, \
+         `apk add util-linux`, `dnf install util-linux`).",
+    )
 }
 
 /// Find the executable path for a command

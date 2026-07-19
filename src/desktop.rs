@@ -102,10 +102,10 @@ fn parse_desktop_file(path: &Path) -> Result<HashMap<String, String>> {
         }
 
         // Parse key=value pairs
-        if in_desktop_entry {
-            if let Some((key, value)) = line.split_once('=') {
-                entries.insert(key.trim().to_string(), value.trim().to_string());
-            }
+        if in_desktop_entry
+            && let Some((key, value)) = line.split_once('=')
+        {
+            entries.insert(key.trim().to_string(), value.trim().to_string());
         }
     }
 
@@ -173,9 +173,7 @@ fn transform_desktop_content(
                     _ => {}
                 }
             }
-        } else if trimmed.starts_with("Exec=") {
-            // Exec in [Desktop Action ...] sections — also wrap
-            let value = &trimmed[5..];
+        } else if let Some(value) = trimmed.strip_prefix("Exec=") {
             output.push_str(&format!(
                 "Exec=proxy-jail app exec --jail {} -- {}\n",
                 jail_name, value
@@ -259,7 +257,7 @@ pub fn list_desktop_files(jail_name: Option<&str>) -> Result<Vec<PathBuf>> {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map_or(false, |ext| ext == "desktop") {
+            if path.extension().is_some_and(|ext| ext == "desktop") {
                 let filename = path.file_name().unwrap().to_string_lossy();
 
                 match jail_name {

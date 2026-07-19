@@ -18,6 +18,12 @@ case "$1" in
 # Allow members of group sudo to execute proxy-jail without a password.
 # Only proxy-jail itself is exposed via sudoers; the ip/iptables commands
 # it spawns run internally after privilege elevation.
+#
+# proxy-jail re-execs itself via `sudo -E` to preserve the GUI
+# environment (DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS, etc.).
+# env_delete strips variables that would let the user inject code
+# into the root process before it drops privileges back via setpriv.
+Defaults env_delete += "LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH PERL5LIB RUBYLIB NODE_PATH LUA_PATH LUA_CPATH JAVA_TOOL_OPTIONS"
 ALL ALL=(root) NOPASSWD: $PROXY_JAIL_BIN
 EOF
             chmod 0440 "$SUDOERS_FILE"

@@ -85,7 +85,7 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         .with_context(|| format!("Failed to create tun2socks log file: {:?}", tun2socks_log))?;
 
     let mut cmd = Command::new("ip");
-    cmd.args(&[
+    cmd.args([
         "netns", "exec", &netns_name,
         tun2socks,
         "--device", "tun://tun0",
@@ -210,7 +210,7 @@ fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()
     loop {
         // Check if device exists in namespace (needs sudo for netns access)
         let output = Command::new("sudo")
-            .args(&["ip", "netns", "exec", netns_name, "ip", "link", "show", device])
+            .args(["ip", "netns", "exec", netns_name, "ip", "link", "show", device])
             .output();
 
         match output {

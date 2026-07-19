@@ -488,14 +488,14 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
     let mut jails: Vec<&JailConfig> = config
         .jails
         .iter()
-        .filter(|j| jail_filter.map_or(true, |name| j.name == name))
+        .filter(|j| jail_filter.is_none_or(|name| j.name == name))
         .collect();
     jails.sort_by(|a, b| a.name.cmp(&b.name));
 
-    if let Some(name) = jail_filter {
-        if jails.is_empty() {
-            anyhow::bail!("Jail '{}' not found", name);
-        }
+    if let Some(name) = jail_filter
+        && jails.is_empty()
+    {
+        anyhow::bail!("Jail '{}' not found", name);
     }
 
     // Column widths tuned to typical Linux process names. Wider names are

@@ -6,12 +6,11 @@ use users::os::unix::UserExt;
 /// Resolve the real user's home directory, even when running under sudo.
 /// Under sudo, $HOME=/root but SUDO_UID points to the invoking user.
 pub fn real_home() -> PathBuf {
-    if let Ok(uid) = std::env::var("SUDO_UID") {
-        if let Ok(uid) = uid.parse::<u32>() {
-            if let Some(user) = users::get_user_by_uid(uid) {
-                return user.home_dir().to_path_buf();
-            }
-        }
+    if let Ok(uid) = std::env::var("SUDO_UID")
+        && let Ok(uid) = uid.parse::<u32>()
+        && let Some(user) = users::get_user_by_uid(uid)
+    {
+        return user.home_dir().to_path_buf();
     }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"))
 }
