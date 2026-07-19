@@ -199,6 +199,23 @@ cargo build
 cargo test
 ```
 
+### Releasing
+
+Push a `v*` tag to trigger the GitHub Actions workflow, which builds `.deb`
+packages for `amd64` and `arm64` and attaches them to a GitHub Release:
+
+```bash
+git tag v1.0.0
+git push --tags
+```
+
+To build a `.deb` locally:
+
+```bash
+scripts/fetch-tun2socks.sh           # downloads tun2socks for current arch
+cargo deb                            # outputs target/debian/proxy-jail_*.deb
+```
+
 ## License
 
 MIT
