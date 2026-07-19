@@ -46,9 +46,11 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
     info!("Starting tun2socks in namespace: {} -> {}", netns_name, proxy_url);
 
     // Start tun2socks using command-line arguments (more reliable than config file)
-    let child = Command::new("ip")
+    // Use sudo since we're no longer running as root (the program runs as the
+    // real user and only elevates for privileged operations).
+    let child = Command::new("sudo")
         .args(&[
-            "netns", "exec", &netns_name,
+            "ip", "netns", "exec", &netns_name,
             "tun2socks",
             "-device", "tun://tun0",
             "-proxy", &proxy_url,
@@ -140,9 +142,9 @@ fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()
     let check_interval = std::time::Duration::from_millis(100);
 
     loop {
-        // Check if device exists in namespace
-        let output = Command::new("ip")
-            .args(&["netns", "exec", netns_name, "ip", "link", "show", device])
+        // Check if device exists in namespace (needs sudo for netns access)
+        let output = Command::new("sudo")
+            .args(&["ip", "netns", "exec", netns_name, "ip", "link", "show", device])
             .output();
 
         match output {

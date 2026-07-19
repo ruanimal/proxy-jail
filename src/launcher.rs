@@ -10,30 +10,54 @@ pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<(
 
     info!("Launching application in namespace {}: {} {}", netns_name, command, args.join(" "));
 
-    // We're running as root (elevated via sudo), use ip netns exec to enter namespace
-    // su drops privileges to the real user (SUDO_USER)
-    let real_user = env::var("SUDO_USER").unwrap_or_else(|_| env::var("USER").unwrap_or_else(|_| "root".to_string()));
-    let mut nsenter_args = vec![
+    // Determine the real user from SUDO_USER (set automatically by sudo).
+    let real_user = env::var("SUDO_USER")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_else(|_| "root".to_string());
+
+    // Path to the environment file saved before sudo re-exec.
+    // SUDO_UID is set automatically by sudo — we use it to locate the
+    // temp file written by the unprivileged parent process.
+    let env_file = match env::var("SUDO_UID") {
+        Ok(uid) => format!("/tmp/pj-env-{}", uid),
+        Err(_) => format!("/tmp/pj-env-{}", nix::unistd::Uid::current().as_raw()),
+    };
+
+    // Build the command that runs inside the namespace.
+    // `su -s /bin/bash` runs a bash shell as the target user.
+    // The `-c` argument sources the saved environment, then execs the app.
+    // Using `exec` replaces the shell so signals reach the app directly.
+    let raw_command = if args.is_empty() {
+        format!("exec {}", command)
+    } else {
+        // Join args, escaping each for shell safety
+        let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+        format!("exec {} {}", command, escaped_args.join(" "))
+    };
+
+    // Source the environment file (if it exists) and run the command.
+    // `su -s /bin/bash` instead of `su -` avoids a login shell that would
+    // overwrite the sourced environment with /etc/profile defaults.
+    let shell_cmd = format!(
+        "test -f '{}' && . '{}' ; {}",
+        env_file, env_file, raw_command
+    );
+
+    let nsenter_args = vec![
         "netns".to_string(),
         "exec".to_string(),
         netns_name.clone(),
         "su".to_string(),
-        "-".to_string(),
+        "-s".to_string(),
+        "/bin/bash".to_string(),
         real_user,
         "-c".to_string(),
+        shell_cmd,
     ];
-
-    // Build the full command
-    let full_command = if args.is_empty() {
-        command.to_string()
-    } else {
-        format!("{} {}", command, args.join(" "))
-    };
-    nsenter_args.push(full_command);
 
     debug!("Running: ip {}", nsenter_args.join(" "));
 
-    // Execute the command (we're root, so ip netns exec works directly)
+    // Execute the command (we're root after sudo re-exec, ip netns exec works directly)
     let status = std::process::Command::new("ip")
         .args(&nsenter_args)
         .status()
@@ -44,6 +68,19 @@ pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<(
     }
 
     Ok(())
+}
+
+/// Escape a string for safe use in a shell command.
+fn shell_escape(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    // If it only contains safe characters, return as-is
+    if s.chars().all(|c| c.is_alphanumeric() || "-_./=@:,+~".contains(c)) {
+        return s.to_string();
+    }
+    // Otherwise, wrap in single quotes with internal quotes escaped
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Find the executable path for a command

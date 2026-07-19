@@ -111,8 +111,15 @@ enum DesktopCommands {
 }
 
 fn main() -> Result<()> {
-    // If not running as root, re-exec ourselves via sudo
+    // If not running as root, re-exec ourselves via sudo.
+    // Save the real user and current environment so the child process
+    // can run GUI apps with the caller's full environment intact.
     if !nix::unistd::Uid::effective().is_root() {
+        // Save environment variables to a temp file so they survive sudo.
+        // The child (root) process will source this file when dropping
+        // privileges back to the real user via SUDO_UID.
+        let env_file = save_env_to_file()?;
+
         let args: Vec<String> = std::env::args().collect();
         let exe = std::env::current_exe()
             .context("Failed to get current executable path")?;
@@ -124,6 +131,8 @@ fn main() -> Result<()> {
             .status()
             .context("Failed to execute sudo")?;
 
+        // Clean up temp file
+        let _ = std::fs::remove_file(&env_file);
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -213,4 +222,24 @@ fn init_logging(verbosity: u8) {
         .with_file(false)
         .with_line_number(false)
         .init();
+}
+
+/// Save all current environment variables to a temporary file as shell
+/// `export` statements.  The file is sourced by the child process after
+/// sudo so that GUI applications inherit the caller's full environment.
+fn save_env_to_file() -> Result<std::path::PathBuf> {
+    let uid = nix::unistd::Uid::current().as_raw();
+    let path = std::path::PathBuf::from(format!("/tmp/pj-env-{}", uid));
+
+    let mut content = String::new();
+    for (key, value) in std::env::vars() {
+        // Escape single quotes in the value for safe shell embedding.
+        let escaped = value.replace('\'', "'\\''");
+        content.push_str(&format!("export {}='{}'\n", key, escaped));
+    }
+
+    std::fs::write(&path, &content)
+        .with_context(|| format!("Failed to write env file: {:?}", path))?;
+
+    Ok(path)
 }
