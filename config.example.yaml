@@ -1,10 +1,14 @@
 # Proxy Jail Configuration
-# Place this file at /etc/proxy-jail/config.yaml
+# Place this file at ~/.config/proxy-jail/config.yaml
+#
+# host: Use "gateway" to route through the host's network namespace
+#       gateway IP (for proxies listening on localhost).  Otherwise
+#       use a LAN or external IP that the namespace can reach directly.
 
 jails:
   - name: work
     proxy:
-      host: "127.0.0.1"
+      host: "gateway"
       port: 1080
       type: socks5
       # Optional authentication

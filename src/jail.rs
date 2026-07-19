@@ -14,11 +14,28 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
     // Parse socks5 address
     let (host, port) = parse_socks5_addr(socks5_addr)?;
 
+    // Inside a network namespace, 127.0.0.1 refers to the namespace's own
+    // loopback — not the host's.  Rewrite to "gateway" so the YAML config
+    // is unambiguous, and the actual IP is resolved at runtime.
+    let effective_host = if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        warn!(
+            "Proxy host '{}' refers to the local machine, but inside the network \
+             namespace this would point to the namespace's own loopback. \
+             Saving proxy host as 'gateway' — the actual IP will be resolved \
+             at runtime. If your proxy listens on a specific LAN address, \
+             prefer using that address directly.",
+            host
+        );
+        "gateway".to_string()
+    } else {
+        host
+    };
+
     // Create jail configuration
     let jail = JailConfig {
         name: name.to_string(),
         proxy: crate::config::ProxyConfig {
-            host,
+            host: effective_host,
             port,
             proxy_type: "socks5".to_string(),
             auth: None,
@@ -65,6 +82,36 @@ pub fn list_jails(config: &Config) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Start a jail (create network namespace + start tun2socks)
+pub fn start_jail(name: &str, config: &Config) -> Result<()> {
+    let jail = config.find_jail(name)
+        .with_context(|| format!("Jail '{}' not found", name))?;
+
+    info!("Starting jail: {}", name);
+
+    // Acquire lock
+    let _lock = acquire_lock(jail)?;
+
+    if network::netns_exists(&jail.netns_name())
+        && proxy::check_tun2socks_running(jail)?.is_some()
+    {
+        info!("Jail '{}' is already running", name);
+        return Ok(());
+    }
+
+    if network::netns_exists(&jail.netns_name()) {
+        // Netns exists but tun2socks is not running — just restart tun2socks
+        let subnet = jail.get_subnet(&config.jails);
+        proxy::start_tun2socks(jail, &subnet)?;
+    } else {
+        // Full initialization: create network + start tun2socks
+        initialize_jail(jail, config)?;
+    }
+
+    info!("Jail '{}' started", name);
     Ok(())
 }
 

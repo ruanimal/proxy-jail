@@ -142,11 +142,16 @@ Configuration is stored at `~/.config/proxy-jail/config.yaml` (respects `$XDG_CO
 jails:
   - name: work
     proxy:
-      host: "127.0.0.1"
+      host: "gateway"
       port: 1080
       type: socks5
-
 ```
+
+> **Note**: Use `host: "gateway"` for proxies listening on localhost.
+> Inside the network namespace, `127.0.0.1` would refer to the namespace's
+> own loopback, not the host. The `"gateway"` value is automatically
+> resolved to the host's veth IP at runtime. If your proxy listens on a
+> specific LAN address, use that address directly instead.
 
 ## How it works
 

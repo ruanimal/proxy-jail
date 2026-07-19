@@ -55,6 +55,11 @@ enum JailCommands {
     },
     /// List all jails
     List,
+    /// Start a jail (create network namespace + start tun2socks)
+    Start {
+        /// Jail name
+        name: String,
+    },
     /// Stop a jail
     Stop {
         /// Jail name
@@ -162,6 +167,9 @@ fn main() -> Result<()> {
             }
             JailCommands::List => {
                 jail::list_jails(&config)?;
+            }
+            JailCommands::Start { name } => {
+                jail::start_jail(&name, &config)?;
             }
             JailCommands::Stop { name } => {
                 jail::stop_jail(&name, &config)?;
