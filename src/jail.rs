@@ -146,6 +146,95 @@ pub fn run_app(
     Ok(())
 }
 
+/// One process running inside a jail's network namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppProcess {
+    pub pid: i32,
+    pub command: String,
+}
+
+/// Parse the tab/whitespace-separated output of
+/// `ps -e -o pid=,comm= --no-headers` into `AppProcess` rows.
+///
+/// Lines with no PID or non-numeric PIDs are silently skipped.
+pub fn parse_ps_output(output: &str) -> Vec<AppProcess> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid: i32 = parts.next()?.parse().ok()?;
+            let command: String = parts.collect::<Vec<_>>().join(" ");
+            Some(AppProcess { pid, command })
+        })
+        .collect()
+}
+
+/// Enumerate processes inside a single jail's network namespace by running
+/// `ip netns exec <netns> ps -e -o pid=,comm= --no-headers`.
+///
+/// Returns an empty `Vec` if the command fails (e.g. netns disappeared
+/// between the existence check and the enumeration) so listing stays robust.
+fn list_ns_processes(netns: &str) -> Vec<AppProcess> {
+    let output = std::process::Command::new("ip")
+        .args(["netns", "exec", netns, "ps", "-e", "-o", "pid=,comm=", "--no-headers"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => parse_ps_output(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Enumerate running user applications across all (or one) jail(s).
+pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
+    // Apply filter at config level, then sort so output is stable and
+    // independent of config-file order.
+    let mut jails: Vec<&JailConfig> = config
+        .jails
+        .iter()
+        .filter(|j| jail_filter.map_or(true, |name| j.name == name))
+        .collect();
+    jails.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if let Some(name) = jail_filter {
+        if jails.is_empty() {
+            anyhow::bail!("Jail '{}' not found", name);
+        }
+    }
+
+    let mut rows: Vec<(String, i32, String)> = Vec::new();
+
+    for jail in &jails {
+        // Skip jails whose netns has not been created yet (never started).
+        if !network::netns_exists(&jail.netns_name()) {
+            continue;
+        }
+
+        let tun2socks_pid = proxy::check_tun2socks_running(jail)?;
+
+        for proc in list_ns_processes(&jail.netns_name()) {
+            // Hide the internal tun2socks process from the user-facing list.
+            if tun2socks_pid.map_or(false, |p| p as i32 == proc.pid) {
+                continue;
+            }
+            rows.push((jail.name.clone(), proc.pid, proc.command));
+        }
+    }
+
+    if rows.is_empty() {
+        println!("No running applications in proxy-jail.");
+        return Ok(());
+    }
+
+    println!("{:<15} {:<8} {}", "JAIL", "PID", "COMMAND");
+    println!("{:-<15} {:-<8} {:-<20}", "", "", "");
+    for (jail, pid, cmd) in &rows {
+        println!("{:<15} {:<8} {}", jail, pid, cmd);
+    }
+
+    Ok(())
+}
+
 /// Stop an application in a jail
 pub fn stop_app(jail_name: &str, app_name: &str, config: &Config) -> Result<()> {
     let jail = config.find_jail(jail_name)
@@ -259,5 +348,41 @@ mod tests {
 
         assert!(parse_socks5_addr("invalid").is_err());
         assert!(parse_socks5_addr("host:99999").is_err());
+    }
+
+    #[test]
+    fn test_parse_ps_output_basic() {
+        let input = "\
+ 100 tun2socks
+ 200 firefox
+ 300 codex --new-instance
+";
+        let procs = parse_ps_output(input);
+        assert_eq!(
+            procs,
+            vec![
+                AppProcess { pid: 100, command: "tun2socks".into() },
+                AppProcess { pid: 200, command: "firefox".into() },
+                AppProcess { pid: 300, command: "codex --new-instance".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_ps_output_empty() {
+        assert!(parse_ps_output("").is_empty());
+        assert!(parse_ps_output("\n\n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_ps_output_skips_garbage() {
+        // Header line, blank line, malformed line — only valid rows survive.
+        let input = "\
+PID COMM
+not-a-pid foo
+ 42 bar
+";
+        let procs = parse_ps_output(input);
+        assert_eq!(procs, vec![AppProcess { pid: 42, command: "bar".into() }]);
     }
 }

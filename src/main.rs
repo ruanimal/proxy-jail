@@ -78,6 +78,12 @@ enum AppCommands {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// List running applications across jails
+    List {
+        /// Filter by jail name
+        #[arg(long)]
+        jail: Option<String>,
+    },
     /// Stop an application in a jail
     Stop {
         /// Jail name
@@ -172,6 +178,9 @@ fn main() -> Result<()> {
                 let cmd = &command[0];
                 let args = &command[1..];
                 jail::run_app(&jail, cmd, args, &config)?;
+            }
+            AppCommands::List { jail } => {
+                jail::list_apps(jail.as_deref(), &config)?;
             }
             AppCommands::Stop { jail, app } => {
                 jail::stop_app(&jail, &app, &config)?;

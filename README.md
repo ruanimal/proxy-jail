@@ -84,6 +84,14 @@ proxy-jail app exec --jail work -- firefox
 proxy-jail jail list
 ```
 
+### List running applications
+
+```bash
+proxy-jail app list
+# or filter to a single jail
+proxy-jail app list --jail work
+```
+
 ### Install desktop entry
 
 ```bash
