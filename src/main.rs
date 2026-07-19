@@ -143,8 +143,20 @@ fn main() -> Result<()> {
             .context("Failed to get current executable path")?;
 
         eprintln!("Elevating privileges via sudo...");
+        // We use `-E` (preserve env) PLUS `--preserve-env=PATH` to
+        // override sudo's hard-coded `secure_path` replacement of
+        // PATH.  Without the explicit preserve, sudo will silently
+        // replace PATH with /usr/local/sbin:/usr/local/bin:... and
+        // the user's toolchain (cargo, go, mise, ...) will be lost.
+        //
+        // Note: sudo's env_reset still hard-clears USER/LOGNAME/HOME/
+        // MAIL/SHELL even with -E.  We rebuild those in
+        // `launcher::spawn_app` from the real user info (which is
+        // available via SUDO_UID/SUDO_USER) before exec'ing the user
+        // command, so this is fine.
         let status = std::process::Command::new("sudo")
             .arg("-E")
+            .arg("--preserve-env=PATH")
             .arg(exe)
             .args(&args[1..])
             .status()

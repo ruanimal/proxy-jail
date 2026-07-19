@@ -4,6 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Child;
 use tracing::{debug, info};
+use users::os::unix::UserExt;
 
 use crate::config::JailConfig;
 
@@ -107,12 +108,58 @@ pub fn spawn_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<Ap
 
     debug!("Running: ip {}", nsenter_args.join(" "));
 
+    // Resolve the real user's home directory via the `users` crate
+    // (nix::unistd::User doesn't expose it).  Fall back to $HOME if
+    // resolution fails — better an approximate value than a spawn error.
+    let real_home = users::get_user_by_uid(real_uid)
+        .map(|u| u.home_dir().to_string_lossy().into_owned())
+        .or_else(|| env::var("HOME").ok())
+        .unwrap_or_else(|| format!("/home/{}", real_user.name));
+
     // Spawn `ip netns exec ...` and let the kernel take it from there.
     // Because `ip netns exec` re-execs into the user command (it does
     // not fork), `child.id()` is the real user pid and `child.wait()`
     // reaps it directly.
-    let child = std::process::Command::new("ip")
-        .args(&nsenter_args)
+    let mut child_cmd = std::process::Command::new("ip");
+    child_cmd.args(&nsenter_args);
+    // Rewrite the environment before passing it to the user command.
+    //
+    // We must use `env_clear()` BEFORE `envs(...)`.  `Command::envs()`
+    // on its own only overrides variables that were explicitly set on
+    // the Command — it does NOT strip variables inherited from the
+    // parent's environment.  So if we only called `envs(filtered)`,
+    // SUDO_* (which sudo set on the root process) would still be
+    // inherited by `ip` and propagated through to the user command.
+    //
+    // `env_clear()` breaks inheritance entirely; `envs(...)` then
+    // installs only the variables we want the child to see.
+    //
+    // What we keep / change:
+    // 1. Drop every SUDO_* variable (information leak about how the
+    //    root process was invoked).
+    // 2. Drop MAIL (sudo sets it to /var/mail/root, which is wrong for
+    //    the unprivileged child).
+    // 3. Restore USER, LOGNAME, HOME to the real user's values.
+    // 4. Keep everything else (DISPLAY, XAUTHORITY, DBUS_*,
+    //    XDG_RUNTIME_DIR, LANG, LC_*, PATH, ...).  PATH is preserved
+    //    verbatim by `sudo -E --preserve-env=PATH` (see `main.rs`),
+    //    so the caller's toolchain is intact.
+    child_cmd.env_clear();
+    let mut target_env: Vec<(String, String)> = Vec::with_capacity(64);
+    for (k, v) in std::env::vars() {
+        if k.starts_with("SUDO_") || k == "MAIL" {
+            continue;
+        }
+        let v = match k.as_str() {
+            "USER" | "LOGNAME" => real_user.name.clone(),
+            "HOME" => real_home.clone(),
+            _ => v,
+        };
+        target_env.push((k, v));
+    }
+    child_cmd.envs(target_env);
+
+    let child = child_cmd
         .spawn()
         .with_context(|| {
             format!(

@@ -12,21 +12,50 @@ PROXY_JAIL_BIN="/usr/bin/proxy-jail"
 
 case "$1" in
     configure)
-        # 仅在缺少文件时写入；upgrade 时文件已存在，保留用户可能的自定义
+        # First-time install: write the full sudoers file from scratch.
+        # We use a heredoc because the contents are a known fixed template
+        # on a clean system.
+        #
+        # The `SETENV:` tag is critical: it lets the user pass `-E` to
+        # sudo for this command only, overriding the system-wide
+        # `env_reset` default so the GUI environment (DISPLAY,
+        # XAUTHORITY, DBUS_SESSION_BUS_ADDRESS, ...) is preserved.
+        # `env_delete` then strips variables that would let the user
+        # inject code into the root process before it drops privileges
+        # back via setpriv.
+        #
+        # Earlier versions of this postinst tried
+        #     Defaults!/usr/bin/proxy-jail !env_reset
+        # which is NOT valid sudoers syntax — env_reset is a boolean
+        # flag, not a negatable Defaults key.  The fix is the SETENV
+        # tag in the User_Spec line below.
         if [ ! -e "$SUDOERS_FILE" ]; then
             cat > "$SUDOERS_FILE" <<EOF
 # Allow members of group sudo to execute proxy-jail without a password.
 # Only proxy-jail itself is exposed via sudoers; the ip/iptables commands
 # it spawns run internally after privilege elevation.
-#
-# proxy-jail re-execs itself via `sudo -E` to preserve the GUI
-# environment (DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS, etc.).
-# env_delete strips variables that would let the user inject code
-# into the root process before it drops privileges back via setpriv.
 Defaults env_delete += "LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH PERL5LIB RUBYLIB NODE_PATH LUA_PATH LUA_CPATH JAVA_TOOL_OPTIONS"
-ALL ALL=(root) NOPASSWD: $PROXY_JAIL_BIN
+ALL ALL=(root) NOPASSWD: SETENV: $PROXY_JAIL_BIN
 EOF
             chmod 0440 "$SUDOERS_FILE"
+        else
+            # Upgrade path: idempotently fix the two common breakage
+            # modes from older postinst versions.
+            #
+            # 1. Remove the broken `Defaults!/usr/bin/proxy-jail !env_reset`
+            #    line if present (it is not valid sudoers syntax and
+            #    does nothing useful).
+            sed -i '/^Defaults!\/usr\/bin\/proxy-jail !env_reset$/d' "$SUDOERS_FILE"
+            # 2. Add `SETENV:` to the User_Spec for /usr/bin/proxy-jail
+            #    if it's not already there, so `sudo -E` is permitted.
+            #    We only touch the User_Spec line for the canonical
+            #    /usr/bin/proxy-jail path; user-added extra paths are
+            #    left alone because the user may want a different
+            #    policy for dev builds (target/release etc.).
+            sed -i 's|^\(ALL ALL=(root) NOPASSWD:\) \(/usr/bin/proxy-jail\)$|\1 SETENV: \2|' "$SUDOERS_FILE"
+            # 3. Ensure env_delete line is present.
+            grep -qxF 'Defaults env_delete += "LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH PERL5LIB RUBYLIB NODE_PATH LUA_PATH LUA_CPATH JAVA_TOOL_OPTIONS"' "$SUDOERS_FILE" || \
+                echo 'Defaults env_delete += "LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH PERL5LIB RUBYLIB NODE_PATH LUA_PATH LUA_CPATH JAVA_TOOL_OPTIONS"' >> "$SUDOERS_FILE"
         fi
 
         # visudo 校验语法，失败则回滚，避免锁死用户系统
