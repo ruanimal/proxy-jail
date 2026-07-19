@@ -171,23 +171,28 @@ pub fn run_app(
 
     info!("Running application in jail '{}': {} {}", jail_name, command, args.join(" "));
 
-    // Acquire lock
-    let _lock = acquire_lock(jail)?;
+    // Acquire lock only for the initialization phase. The lock must be
+    // released before `launch_app` because that call blocks until the
+    // user's command exits (e.g. a long-running server). Holding the lock
+    // would prevent other commands from running in the same jail.
+    {
+        let _lock = acquire_lock(jail)?;
 
-    // Lazy initialization: create network if it doesn't exist
-    if !network::netns_exists(&jail.netns_name()) {
-        info!("Jail not initialized, creating network...");
-        initialize_jail(jail, config)?;
-    }
+        // Lazy initialization: create network if it doesn't exist
+        if !network::netns_exists(&jail.netns_name()) {
+            info!("Jail not initialized, creating network...");
+            initialize_jail(jail, config)?;
+        }
 
-    // Ensure tun2socks is running
-    if proxy::check_tun2socks_running(jail)?.is_none() {
-        info!("tun2socks not running, starting...");
-        let subnet = jail.get_subnet(&config.jails);
-        proxy::start_tun2socks(jail, &subnet)?;
-    }
+        // Ensure tun2socks is running
+        if proxy::check_tun2socks_running(jail)?.is_none() {
+            info!("tun2socks not running, starting...");
+            let subnet = jail.get_subnet(&config.jails);
+            proxy::start_tun2socks(jail, &subnet)?;
+        }
+    } // lock released here
 
-    // Launch the application
+    // Launch the application (blocks until the command finishes)
     crate::launcher::launch_app(jail, command, args)?;
 
     Ok(())
