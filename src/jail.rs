@@ -147,42 +147,88 @@ pub fn run_app(
 }
 
 /// One process running inside a jail's network namespace.
+///
+/// `app_name` is `argv[0]` (the process's basename) and is what users
+/// pass to `app stop` to terminate the process. `command` is the full
+/// cmdline for diagnostic display only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppProcess {
     pub pid: i32,
+    pub app_name: String,
     pub command: String,
 }
 
-/// Parse the tab/whitespace-separated output of
-/// `ps -e -o pid=,comm= --no-headers` into `AppProcess` rows.
+/// Return the inode number of a network namespace identified by `netns`.
 ///
-/// Lines with no PID or non-numeric PIDs are silently skipped.
-pub fn parse_ps_output(output: &str) -> Vec<AppProcess> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let pid: i32 = parts.next()?.parse().ok()?;
-            let command: String = parts.collect::<Vec<_>>().join(" ");
-            Some(AppProcess { pid, command })
-        })
-        .collect()
-}
-
-/// Enumerate processes inside a single jail's network namespace by running
-/// `ip netns exec <netns> ps -e -o pid=,comm= --no-headers`.
-///
-/// Returns an empty `Vec` if the command fails (e.g. netns disappeared
-/// between the existence check and the enumeration) so listing stays robust.
-fn list_ns_processes(netns: &str) -> Vec<AppProcess> {
+/// Runs `ip netns exec <netns> readlink /proc/self/ns/net` and parses the
+/// trailing number from `net:[<inode>]`. Returns `Ok(None)` if the command
+/// fails (netns absent, permission denied, etc.) so callers can degrade
+/// gracefully instead of erroring out a partial listing.
+fn netns_inode(netns: &str) -> Result<Option<u64>> {
     let output = std::process::Command::new("ip")
-        .args(["netns", "exec", netns, "ps", "-e", "-o", "pid=,comm=", "--no-headers"])
+        .args(["netns", "exec", netns, "readlink", "/proc/self/ns/net"])
         .output();
 
-    match output {
-        Ok(out) if out.status.success() => parse_ps_output(&String::from_utf8_lossy(&out.stdout)),
-        _ => Vec::new(),
+    let out = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Ok(None),
+    };
+
+    let s = String::from_utf8_lossy(&out.stdout);
+    // Expected: "net:[4026533311]\n"
+    let inode: u64 = s
+        .trim()
+        .trim_start_matches("net:[")
+        .trim_end_matches(']')
+        .parse()
+        .with_context(|| format!("Cannot parse netns inode from {:?}", s))?;
+    Ok(Some(inode))
+}
+
+/// Walk `/proc/*/ns/net` and return every process whose network namespace
+/// is the one identified by `inode`.
+///
+/// `read_cmdline(pid)` is injected so unit tests can supply canned
+/// `/proc/<pid>/cmdline` content. It must return `(app_name, command)`
+/// where `app_name` is argv[0] (the basename users pass to `app stop`)
+/// and `command` is the full cmdline for display.
+fn list_ns_processes_by_inode<F>(inode: u64, read_cmdline: F) -> Vec<AppProcess>
+where
+    F: Fn(i32) -> Option<(String, String)>,
+{
+    let target = format!("net:[{}]", inode);
+    let mut out = Vec::new();
+
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let pid: i32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // /proc/<pid>/ns/net is a symlink; readlink returns "net:[<inode>]"
+        let link = match std::fs::read_link(format!("/proc/{}/ns/net", pid)) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if link.to_string_lossy() != target {
+            continue;
+        }
+
+        let (app_name, command) = match read_cmdline(pid) {
+            Some(c) => c,
+            None => continue,
+        };
+        out.push(AppProcess { pid, app_name, command });
     }
+
+    out
 }
 
 /// Enumerate running user applications across all (or one) jail(s).
@@ -202,7 +248,15 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
         }
     }
 
-    let mut rows: Vec<(String, i32, String)> = Vec::new();
+    // Column widths tuned to typical Linux process names. Wider names are
+    // truncated by the {:<N} formatter; users can read the full arg list
+    // from the COMMAND column.
+    const JAIL_W: usize = 15;
+    const PID_W: usize = 8;
+    const APP_W: usize = 20;
+    const CMD_MIN: usize = 20;
+
+    let mut rows: Vec<(String, i32, String, String)> = Vec::new();
 
     for jail in &jails {
         // Skip jails whose netns has not been created yet (never started).
@@ -210,14 +264,19 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
             continue;
         }
 
+        let inode = match netns_inode(&jail.netns_name())? {
+            Some(i) => i,
+            None => continue, // netns gone or unreadable — skip
+        };
+
         let tun2socks_pid = proxy::check_tun2socks_running(jail)?;
 
-        for proc in list_ns_processes(&jail.netns_name()) {
+        for proc in list_ns_processes_by_inode(inode, |pid| read_cmdline(pid)) {
             // Hide the internal tun2socks process from the user-facing list.
             if tun2socks_pid.map_or(false, |p| p as i32 == proc.pid) {
                 continue;
             }
-            rows.push((jail.name.clone(), proc.pid, proc.command));
+            rows.push((jail.name.clone(), proc.pid, proc.app_name, proc.command));
         }
     }
 
@@ -226,56 +285,94 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<15} {:<8} {}", "JAIL", "PID", "COMMAND");
-    println!("{:-<15} {:-<8} {:-<20}", "", "", "");
-    for (jail, pid, cmd) in &rows {
-        println!("{:<15} {:<8} {}", jail, pid, cmd);
+    // Local bindings used in the format strings below (Rust's format!
+    // does not support `::<N` width specifiers).
+    let jail_w = JAIL_W;
+    let pid_w = PID_W;
+    let app_w = APP_W;
+    let cmd_min = CMD_MIN;
+
+    println!(
+        "{:<jail_w$} {:<pid_w$} {:<app_w$} {}",
+        "JAIL", "PID", "APP", "COMMAND",
+    );
+    println!(
+        "{:->jail_w$} {:->pid_w$} {:->app_w$} {:->cmd_min$}",
+        "", "", "", ""
+    );
+    for (jail, pid, app, cmd) in &rows {
+        println!(
+            "{:<jail_w$} {:<pid_w$} {:<app_w$} {}",
+            jail, pid, app, cmd
+        );
     }
+
+    println!(
+        "\nTip: copy the APP column to `app stop --jail {} <APP>`",
+        jail_filter.unwrap_or("JAIL")
+    );
 
     Ok(())
 }
 
-/// Stop an application in a jail
+/// Stop an application in a jail.
+///
+/// Matches `app_name` against `argv[0]` (basename) of every process in the
+/// jail's network namespace. This deliberately uses the same enumeration
+/// path as `list_apps` so that whatever `list_apps` reports as `APP` can
+/// be passed straight back into `stop`.
+///
+/// We **do not** use `pgrep -f` because it matches its own command line
+/// (and the `sudo`/`ip` wrapper chain), which can cause the `stop`
+/// command to kill its own ancestors.
 pub fn stop_app(jail_name: &str, app_name: &str, config: &Config) -> Result<()> {
     let jail = config.find_jail(jail_name)
         .with_context(|| format!("Jail '{}' not found", jail_name))?;
 
     info!("Stopping application '{}' in jail '{}'", app_name, jail_name);
 
-    // Find processes matching the app name in the namespace
-    let netns_name = jail.netns_name();
-
-    // Use pgrep to find processes
-    let output = std::process::Command::new("ip")
-        .args(&["netns", "exec", &netns_name, "pgrep", "-f", app_name])
-        .output()
-        .context("Failed to search for processes")?;
-
-    let pids = String::from_utf8_lossy(&output.stdout);
-
-    if pids.trim().is_empty() {
-        warn!("No processes found for '{}'", app_name);
+    // Skip if the jail has not been initialized yet (no netns).
+    if !network::netns_exists(&jail.netns_name()) {
+        warn!("Jail '{}' is not running", jail_name);
         return Ok(());
     }
 
-    // Kill each process
-    for pid_str in pids.lines() {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            // Skip tun2socks process
-            if let Some(tun2socks_pid) = proxy::check_tun2socks_running(jail)? {
-                if pid == tun2socks_pid as i32 {
-                    continue;
-                }
-            }
+    let inode = match netns_inode(&jail.netns_name())? {
+        Some(i) => i,
+        None => {
+            warn!("Cannot read netns inode for jail '{}'", jail_name);
+            return Ok(());
+        }
+    };
 
-            debug!("Sending SIGTERM to PID: {}", pid);
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+    let tun2socks_pid = proxy::check_tun2socks_running(jail)?;
+
+    // Collect matching pids first, then kill — never let a kill of one
+    // pid affect the iteration over /proc.
+    let mut targets: Vec<i32> = list_ns_processes_by_inode(inode, |pid| read_cmdline(pid))
+        .into_iter()
+        .filter(|p| p.app_name == app_name)
+        .filter(|p| tun2socks_pid.map_or(true, |t| t as i32 != p.pid))
+        .map(|p| p.pid)
+        .collect();
+
+    if targets.is_empty() {
+        warn!("No processes found for '{}' in jail '{}'", app_name, jail_name);
+        return Ok(());
+    }
+
+    targets.sort_unstable();
+    for pid in &targets {
+        debug!("Sending SIGTERM to PID: {}", pid);
+        // SAFETY: pid came from a directory scan of /proc; it is valid
+        // at the time of read but may have exited by the time we kill.
+        // kill() on a nonexistent pid returns ESRCH, which is harmless.
+        unsafe {
+            libc::kill(*pid, libc::SIGTERM);
         }
     }
 
-    info!("Application '{}' stopped", app_name);
+    info!("Application '{}' stopped ({} process(es))", app_name, targets.len());
     Ok(())
 }
 
@@ -332,6 +429,54 @@ fn parse_socks5_addr(addr: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
+/// Parse raw `/proc/<pid>/cmdline` bytes (NUL-separated argv) into the
+/// `(app_name, command)` tuple used by `read_cmdline`.
+///
+/// `app_name` is the basename of `argv[0]` (what users pass to
+/// `app stop`); `command` is the full cmdline joined with spaces.
+fn parse_cmdline_bytes(bytes: &[u8]) -> Option<(String, String)> {
+    if bytes.is_empty() || bytes[0] == 0 {
+        return None;
+    }
+    let parts: Vec<String> = bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let command = parts.join(" ");
+    let app_name = std::path::Path::new(&parts[0])
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| parts[0].clone());
+    Some((app_name, command))
+}
+
+/// Read a process's argv from `/proc/<pid>/cmdline` (NUL-separated).
+///
+/// Returns `(app_name, command)`:
+/// - `app_name` is `argv[0]` (basename) — what users pass to `app stop`.
+/// - `command` is the full cmdline for diagnostic display.
+///
+/// Falls back to `/proc/<pid>/comm` if cmdline is empty (kernel threads).
+/// Returns `None` if the process disappears between directory scan and read.
+fn read_cmdline(pid: i32) -> Option<(String, String)> {
+    let path = format!("/proc/{}/cmdline", pid);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Some(parsed) = parse_cmdline_bytes(&bytes) {
+            return Some(parsed);
+        }
+    }
+    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .ok()
+        .map(|s| {
+            let app_name = s.trim().to_string();
+            (app_name.clone(), app_name)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,38 +496,48 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ps_output_basic() {
-        let input = "\
- 100 tun2socks
- 200 firefox
- 300 codex --new-instance
-";
-        let procs = parse_ps_output(input);
-        assert_eq!(
-            procs,
-            vec![
-                AppProcess { pid: 100, command: "tun2socks".into() },
-                AppProcess { pid: 200, command: "firefox".into() },
-                AppProcess { pid: 300, command: "codex --new-instance".into() },
-            ]
-        );
+    fn test_parse_cmdline_bytes_simple() {
+        // /proc/<pid>/cmdline is NUL-separated argv (no trailing NUL is
+        // optional, so we don't rely on it).
+        let bytes = b"firefox\0--new-instance\0%u";
+        let (app, cmd) = parse_cmdline_bytes(bytes).unwrap();
+        assert_eq!(app, "firefox");
+        assert_eq!(cmd, "firefox --new-instance %u");
     }
 
     #[test]
-    fn test_parse_ps_output_empty() {
-        assert!(parse_ps_output("").is_empty());
-        assert!(parse_ps_output("\n\n").is_empty());
+    fn test_parse_cmdline_bytes_strips_path() {
+        // argv[0] is the full path to the executable; users see just the
+        // basename in the APP column.
+        let bytes = b"/usr/bin/firefox\0--new-window\0";
+        let (app, _cmd) = parse_cmdline_bytes(bytes).unwrap();
+        assert_eq!(app, "firefox");
     }
 
     #[test]
-    fn test_parse_ps_output_skips_garbage() {
-        // Header line, blank line, malformed line — only valid rows survive.
-        let input = "\
-PID COMM
-not-a-pid foo
- 42 bar
-";
-        let procs = parse_ps_output(input);
-        assert_eq!(procs, vec![AppProcess { pid: 42, command: "bar".into() }]);
+    fn test_parse_cmdline_bytes_empty_or_kernel_thread() {
+        // Empty (kernel threads have empty cmdline) and all-NUL are None.
+        assert!(parse_cmdline_bytes(b"").is_none());
+        assert!(parse_cmdline_bytes(b"\0\0").is_none());
+    }
+
+    /// `stop_app` filters by exact `app_name` match (argv[0] basename).
+    /// This test exercises the filter logic in isolation: a "firefox"
+    /// match must NOT also kill a process whose command line merely
+    /// contains "firefox" as a substring (e.g. "/usr/share/firefox-extra/firefox-helper").
+    #[test]
+    fn test_stop_filter_is_exact_app_name() {
+        let procs = vec![
+            AppProcess { pid: 100, app_name: "firefox".into(),     command: "firefox".into() },
+            AppProcess { pid: 200, app_name: "firefox".into(),     command: "firefox --new-window".into() },
+            AppProcess { pid: 300, app_name: "firefox-helper".into(), command: "/usr/share/firefox-helper".into() },
+        ];
+        let want = "firefox";
+        let mut targets: Vec<i32> = procs.iter()
+            .filter(|p| p.app_name == want)
+            .map(|p| p.pid)
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(targets, vec![100, 200]); // helper excluded
     }
 }
