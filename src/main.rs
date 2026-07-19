@@ -36,6 +36,11 @@ enum Commands {
         #[command(subcommand)]
         command: AppCommands,
     },
+    /// Manage desktop entries
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -64,40 +69,40 @@ enum JailCommands {
 
 #[derive(Subcommand)]
 enum AppCommands {
-    /// Run an application in a jail
-    Run {
+    /// Execute a command in a jail
+    Exec {
         /// Jail name
+        #[arg(long)]
         jail: String,
-        /// Command to run
+        /// Command to run (after `--`)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
     /// Stop an application in a jail
     Stop {
         /// Jail name
+        #[arg(long)]
         jail: String,
         /// Application name
         app: String,
-    },
-    /// Manage desktop entries
-    Desktop {
-        #[command(subcommand)]
-        command: DesktopCommands,
     },
 }
 
 #[derive(Subcommand)]
 enum DesktopCommands {
-    /// Install a desktop entry from a .desktop file
-    Install {
+    /// Create a desktop entry from a .desktop file
+    Create {
         /// Jail name
+        #[arg(long)]
         jail: String,
         /// Path to .desktop file (or name found in system directories)
-        desktop_file: String,
+        #[arg(long)]
+        from: String,
     },
-    /// Uninstall a desktop entry
-    Uninstall {
+    /// Delete a desktop entry
+    Delete {
         /// Jail name
+        #[arg(long)]
         jail: String,
         /// .desktop file name (e.g. firefox.desktop or pj-xray-firefox.desktop)
         desktop_file: String,
@@ -160,7 +165,7 @@ fn main() -> Result<()> {
             }
         },
         Commands::App { command } => match command {
-            AppCommands::Run { jail, command } => {
+            AppCommands::Exec { jail, command } => {
                 if command.is_empty() {
                     anyhow::bail!("No command specified");
                 }
@@ -171,32 +176,32 @@ fn main() -> Result<()> {
             AppCommands::Stop { jail, app } => {
                 jail::stop_app(&jail, &app, &config)?;
             }
-            AppCommands::Desktop { command } => match command {
-                DesktopCommands::Install { jail, desktop_file } => {
-                    let jail_config = config.find_jail(&jail)
-                        .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
+        },
+        Commands::Desktop { command } => match command {
+            DesktopCommands::Create { jail, from } => {
+                let jail_config = config.find_jail(&jail)
+                    .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
 
-                    desktop::desktop_install_from_file(jail_config, &desktop_file)?;
-                }
-                DesktopCommands::Uninstall { jail, desktop_file } => {
-                    let jail_config = config.find_jail(&jail)
-                        .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
+                desktop::desktop_install_from_file(jail_config, &from)?;
+            }
+            DesktopCommands::Delete { jail, desktop_file } => {
+                let jail_config = config.find_jail(&jail)
+                    .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
 
-                    desktop::desktop_uninstall_from_file(jail_config, &desktop_file)?;
-                }
-                DesktopCommands::List { jail } => {
-                    let files = desktop::list_desktop_files(jail.as_deref())?;
+                desktop::desktop_uninstall_from_file(jail_config, &desktop_file)?;
+            }
+            DesktopCommands::List { jail } => {
+                let files = desktop::list_desktop_files(jail.as_deref())?;
 
-                    if files.is_empty() {
-                        println!("No proxy-jail desktop entries found.");
-                    } else {
-                        println!("Installed proxy-jail desktop entries:");
-                        for file in files {
-                            println!("  {:?}", file);
-                        }
+                if files.is_empty() {
+                    println!("No proxy-jail desktop entries found.");
+                } else {
+                    println!("Installed proxy-jail desktop entries:");
+                    for file in files {
+                        println!("  {:?}", file);
                     }
                 }
-            },
+            }
         },
     }
 

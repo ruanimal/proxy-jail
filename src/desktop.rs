@@ -160,7 +160,7 @@ fn transform_desktop_content(
                     "Exec" if !key.contains('[') => {
                         // Main Exec field — wrap with proxy-jail
                         output.push_str(&format!(
-                            "Exec=proxy-jail app run {} -- {}\n",
+                            "Exec=proxy-jail app exec --jail {} -- {}\n",
                             jail_name, value
                         ));
                         continue;
@@ -177,7 +177,7 @@ fn transform_desktop_content(
             // Exec in [Desktop Action ...] sections — also wrap
             let value = &trimmed[5..];
             output.push_str(&format!(
-                "Exec=proxy-jail app run {} -- {}\n",
+                "Exec=proxy-jail app exec --jail {} -- {}\n",
                 jail_name, value
             ));
             continue;
@@ -344,7 +344,7 @@ Exec=/usr/bin/codex-update-manager install-ready
         // [Desktop Entry] fields: Name/Exec/Comment modified, rest unchanged
         assert!(result.contains("Name=Codex Desktop (jail: testjail)"));
         assert!(result.contains("Comment=Run Codex Desktop on Linux (via proxy-jail)"));
-        assert!(result.contains("Exec=proxy-jail app run testjail -- env BAMF_DESKTOP_FILE_HINT=/usr/share/applications/codex-desktop.desktop CHROME_DESKTOP=codex-desktop.desktop /usr/bin/codex-desktop %u"));
+        assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- env BAMF_DESKTOP_FILE_HINT=/usr/share/applications/codex-desktop.desktop CHROME_DESKTOP=codex-desktop.desktop /usr/bin/codex-desktop %u"));
         assert!(result.contains("Icon=codex-desktop\n"));
         assert!(result.contains("Terminal=false\n"));
         assert!(result.contains("StartupNotify=true\n"));
@@ -357,9 +357,9 @@ Exec=/usr/bin/codex-update-manager install-ready
         assert!(result.contains("X-Proxy-Jail-Original=/usr/share/applications/codex-desktop.desktop\n"));
 
         // [Desktop Action] Exec lines also wrapped
-        assert!(result.contains("Exec=proxy-jail app run testjail -- env BAMF_DESKTOP_FILE_HINT=/usr/share/applications/codex-desktop.desktop CHROME_DESKTOP=codex-desktop.desktop CODEX_MULTI_LAUNCH=1 /usr/bin/codex-desktop --new-instance"));
-        assert!(result.contains("Exec=proxy-jail app run testjail -- /usr/bin/codex-update-manager check-now"));
-        assert!(result.contains("Exec=proxy-jail app run testjail -- /usr/bin/codex-update-manager install-ready"));
+        assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- env BAMF_DESKTOP_FILE_HINT=/usr/share/applications/codex-desktop.desktop CHROME_DESKTOP=codex-desktop.desktop CODEX_MULTI_LAUNCH=1 /usr/bin/codex-desktop --new-instance"));
+        assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- /usr/bin/codex-update-manager check-now"));
+        assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- /usr/bin/codex-update-manager install-ready"));
 
         // [Desktop Action] Name lines NOT modified
         assert!(result.contains("Name=New Window\n"));

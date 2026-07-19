@@ -30,7 +30,7 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
     config.add_jail(jail)?;
 
     info!("Jail '{}' created successfully", name);
-    info!("To start the jail, run: proxy-jail app run {} -- <command>", name);
+    info!("To start the jail, run: proxy-jail app exec --jail {} -- <command>", name);
 
     Ok(())
 }

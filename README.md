@@ -75,7 +75,7 @@ proxy-jail jail create work --socks5 127.0.0.1:1080
 ### Run an application
 
 ```bash
-proxy-jail app run work -- firefox
+proxy-jail app exec --jail work -- firefox
 ```
 
 ### List jails
@@ -87,7 +87,7 @@ proxy-jail jail list
 ### Install desktop entry
 
 ```bash
-proxy-jail app desktop install work firefox
+proxy-jail desktop create --jail work --from firefox
 ```
 
 ### Stop a jail
