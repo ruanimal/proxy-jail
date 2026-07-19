@@ -7,7 +7,7 @@ Force GUI applications through SOCKS5 proxy using Linux network namespaces and t
 Proxy Jail creates isolated network environments for your applications using Linux network namespaces. All traffic from the jailed application is transparently routed through a SOCKS5 proxy, providing:
 
 - **Complete traffic isolation** - All TCP/UDP/DNS traffic goes through the proxy
-- **No root required** - Uses file capabilities instead of sudo, config stored in user directories
+- **Restricted sudoers, not rootless** - Runs as root *only* via a single, scoped NOPASSWD rule for the `proxy-jail` binary itself; see [Privilege model](#privilege-model)
 - **Transparent to applications** - Apps work normally without configuration
 - **Desktop integration** - Generates .desktop files for seamless launching
 
@@ -77,7 +77,7 @@ echo "$USER ALL=(root) NOPASSWD: /usr/local/bin/proxy-jail" | sudo tee /etc/sudo
 sudo chmod 440 /etc/sudoers.d/proxy-jail
 ```
 
-> **Note**: Only `proxy-jail` itself is allowed via sudoers. Individual `ip`, `iptables` commands are not exposed — they run internally within proxy-jail after privilege elevation.
+> **Note**: Only `proxy-jail` itself is allowed via sudoers. Individual `ip`, `iptables` commands are not exposed — they run internally within proxy-jail after privilege elevation. See [Privilege model](#privilege-model) for the full security boundary.
 
 You will also need a `tun2socks` binary on your `$PATH`:
 ```bash
@@ -235,11 +235,53 @@ under the hood, doesn't auto-detect ports, and stays independent of
 `app exec` so you can expose a port even when the app is started some
 other way.
 
+## Privilege model
+
+proxy-jail is **not rootless**: it requires root to create network namespaces,
+veth pairs, and `iptables` NAT rules, and that root is obtained by re-executing
+itself through `sudo`. What is *scoped* is the surface area of that root — the
+attack surface is the same `proxy-jail` binary, nothing more.
+
+| Aspect | Implementation |
+| --- | --- |
+| Root acquisition | `proxy-jail` re-execs itself via `sudo` (auto-installed by the `.deb`'s `postinst`) |
+| Sudoers rule | `/etc/sudoers.d/proxy-jail` grants `NOPASSWD: /usr/bin/proxy-jail` to all users |
+| What the rule permits | **Only** the `proxy-jail` binary — not `ip`, `iptables`, `tun2socks`, or `nsenter` |
+| Lifetime | Created by `postinst`, removed on `apt purge`, kept on `apt remove` |
+| Application privilege | GUI apps run as the invoking user (`SUDO_UID`), not as root |
+
+### What this is *not*
+
+- **Not rootless in the `yayatht` / `bubblewrap` sense** — no unprivileged
+  user namespaces are used. The kernel does not need `CONFIG_USER_NS` for
+  normal users, but `proxy-jail` itself always runs as real root while
+  building the netns and starting `tun2socks`.
+- **Not a sandbox for untrusted code** — the same user that invokes
+  `proxy-jail` also gets root through it. Do not run this on a multi-user
+  host you do not control, or restrict the sudoers rule to specific users
+  (replace `ALL` with a user list in `/etc/sudoers.d/proxy-jail`).
+- **Not a TTY-bound interactive sudo** — `proxy-jail` will refuse to prompt
+  for a password. If you see `sudo: a password is required`, the sudoers
+  rule is missing or `NOPASSWD` was dropped.
+
+### If you want true rootless operation
+
+proxy-jail cannot currently do this. Alternatives that do:
+
+- [`yayatht`](https://github.com/hmgle/yayatht) — same SOCKS5 use case, but
+  rootless via Linux 6.6+ unprivileged user namespaces (experimental, 0.1.0).
+- [`bubblewrap`](https://github.com/containers/bubblewrap) — generic
+  user-namespace sandbox; you would still need to combine it with a
+  userspace network stack (Slirp4netNS, pasta) and a SOCKS5 client.
+
 ## Security considerations
 
-- Privileged operations use sudo with a scoped sudoers rule (no full root access)
-- Configuration and runtime files are stored in user directories (`~/.config/proxy-jail/`, `$XDG_RUNTIME_DIR/proxy-jail/`)
-- Applications run with dropped privileges (actual user, not root)
+- Privileged operations go through sudo with a scoped sudoers rule
+  (`NOPASSWD: /usr/bin/proxy-jail` only) — see [Privilege model](#privilege-model)
+- Configuration and runtime files are stored in user directories
+  (`~/.config/proxy-jail/`, `$XDG_RUNTIME_DIR/proxy-jail/`)
+- Applications run with dropped privileges (the invoking user via
+  `SUDO_UID`, not root)
 - Network isolation is complete - no traffic leaks outside the proxy
 - DNS queries are also proxied (no DNS leaks)
 
