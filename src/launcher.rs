@@ -1,28 +1,48 @@
 use anyhow::{Context, Result};
 use std::env;
+use std::process::Child;
 use tracing::{debug, info};
 
 use crate::config::JailConfig;
 
-/// Launch an application inside a network namespace.
+/// Handle returned by [`spawn_app`] so the caller can register the
+/// launched process in the apps dir and then wait for it to exit.
+pub struct AppHandle {
+    /// The `Child` returned by `Command::spawn()`.  For `ip netns exec`
+    /// the immediate child IS the target process (iproute2 does
+    /// `setns` + `execve` rather than `fork` + `execve`), so its
+    /// `id()` is the pid users will see in `ps` and `app list`.
+    pub child: Child,
+    /// The argv[0] basename of the user's command — what shows up in
+    /// the `APP` column of `app list`.
+    pub app_name: String,
+    /// Full command line, for display in `app list`.
+    pub command: String,
+}
+
+/// Spawn an application inside a network namespace.
+///
+/// Returns an [`AppHandle`] whose `child.id()` is the pid of the user's
+/// process (because `ip netns exec` re-execs into the target, it does
+/// not fork).  The caller is expected to:
+/// 1. Call [`crate::jail::register_app`] with `child.id()`, `app_name`
+///    and `command` so `app list` and `app stop` can find the process.
+/// 2. Call `child.wait()` (or `child.wait_with_output()`) to reap it
+///    and forward the exit status.
 ///
 /// # Prerequisites
 ///
-/// This function only performs `nsenter` + `su` + `exec` and does **not**
-/// ensure the jail is ready. The caller is responsible for guaranteeing:
-///
-/// 1. The network namespace `pj-{name}` exists (see [`crate::network::create_jail_network`]).
-/// 2. `tun2socks` is running inside the namespace
-///    (see [`crate::proxy::check_tun2socks_running`] /
-///    [`crate::proxy::start_tun2socks`]).
-///
-/// Both prerequisites are satisfied by [`crate::jail::run_app`], which is
-/// the only intended entry point in production. Call this function directly
-/// only from tests or trusted internal code paths.
-pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<()> {
+/// Caller must guarantee the netns `pj-{name}` exists and that
+/// `tun2socks` is running inside it.  See [`crate::jail::run_app`].
+pub fn spawn_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<AppHandle> {
     let netns_name = jail.netns_name();
 
-    info!("Launching application in namespace {}: {} {}", netns_name, command, args.join(" "));
+    info!(
+        "Spawning application in namespace {}: {} {}",
+        netns_name,
+        command,
+        args.join(" ")
+    );
 
     // Determine the real user from SUDO_USER (set automatically by sudo).
     let real_user = env::var("SUDO_USER")
@@ -71,16 +91,49 @@ pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<(
 
     debug!("Running: ip {}", nsenter_args.join(" "));
 
-    // Execute the command (we're root after sudo re-exec, ip netns exec works directly)
-    let status = std::process::Command::new("ip")
+    // Spawn (do NOT wait — we want the child to outlive this function
+    // call so the caller can register it).  We are root at this point
+    // (the unprivileged parent re-exec'd via sudo), so `ip netns exec`
+    // works directly without a nested `sudo`.
+    let child = std::process::Command::new("ip")
         .args(&nsenter_args)
-        .status()
-        .context("Failed to execute command in namespace")?;
+        .spawn()
+        .context("Failed to spawn command in namespace")?;
 
+    let app_name = std::path::Path::new(command)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| command.to_string());
+
+    let cmdline = if args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, args.join(" "))
+    };
+
+    Ok(AppHandle {
+        child,
+        app_name,
+        command: cmdline,
+    })
+}
+
+/// Wait for an [`AppHandle`]'s child to exit and forward the status.
+///
+/// Returns `Ok(())` if the child exited successfully. Returns an error
+/// (with the exit code) otherwise — same contract as the old
+/// `launch_app` so the CLI surface is unchanged.
+pub fn wait_app(handle: &mut AppHandle) -> Result<()> {
+    let status = handle
+        .child
+        .wait()
+        .context("Failed to wait for app child process")?;
     if !status.success() {
-        anyhow::bail!("Command failed with exit code: {}", status.code().unwrap_or(-1));
+        anyhow::bail!(
+            "Command failed with exit code: {}",
+            status.code().unwrap_or(-1)
+        );
     }
-
     Ok(())
 }
 

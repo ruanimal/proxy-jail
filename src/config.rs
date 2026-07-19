@@ -168,7 +168,14 @@ impl JailConfig {
         self.runtime_dir().join("tun2socks.pid")
     }
 
-
+    /// Get the directory where per-app metadata files are stored.
+    ///
+    /// Each `app exec` invocation writes `{app_id}.json` here so that
+    /// `app list` and `app stop` can address the process by its stable
+    /// `app_id` rather than the ambiguous `argv[0]` basename.
+    pub fn apps_dir(&self) -> PathBuf {
+        self.runtime_dir().join("apps")
+    }
 
     /// Get the lock file path for concurrent access
     pub fn lock_file(&self) -> PathBuf {

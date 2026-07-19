@@ -114,6 +114,22 @@ proxy-jail app list
 proxy-jail app list --jail work
 ```
 
+Each row shows a stable `APP_ID` (16 hex chars) for the invocation —
+this is the only thing `app stop` accepts.  Using a stable per-launch
+id (instead of the argv[0] basename) is what makes it safe to run
+multiple instances of the same binary in one jail (e.g. two
+`python` processes): each gets its own id and stops independently.
+
+### Stop a running application
+
+```bash
+# Copy the APP_ID column from `app list`
+proxy-jail app stop --jail work 7f3a2b1c9d4e5f60
+
+# A unique prefix is also accepted
+proxy-jail app stop --jail work 7f3a2b1c
+```
+
 ### Install desktop entry
 
 ```bash
