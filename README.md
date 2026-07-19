@@ -173,20 +173,6 @@ jails:
 - Some applications may not work correctly with network namespace isolation
 
 ## Development
-
-### Project structure
-
-```
-src/
-├── main.rs          # CLI entry point
-├── config.rs        # YAML configuration loading
-├── jail.rs          # Jail lifecycle management
-├── network.rs       # Network namespace operations
-├── proxy.rs         # tun2socks configuration and process management
-├── launcher.rs      # Application launcher (setns + setuid + exec)
-└── desktop.rs       # .desktop file generation
-```
-
 ### Building
 
 ```bash
