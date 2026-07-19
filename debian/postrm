@@ -1,0 +1,29 @@
+#!/bin/sh
+# postrm for proxy-jail
+#
+# 仅在 purge（完全清理）时删除 /etc/sudoers.d/proxy-jail；
+# remove（仅卸载二进制、保留配置）时保留 sudoers，避免影响其他机器状态。
+
+set -e
+
+SUDOERS_FILE="/etc/sudoers.d/proxy-jail"
+
+case "$1" in
+    purge)
+        if [ -e "$SUDOERS_FILE" ]; then
+            rm -f "$SUDOERS_FILE"
+        fi
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

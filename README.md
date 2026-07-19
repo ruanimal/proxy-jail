@@ -32,7 +32,7 @@ Each jail consists of:
   - `CONFIG_VETH=y`
 - `iproute2` (provides `ip` command)
 - `iptables`
-- `tun2socks` binary
+- `tun2socks` binary (bundled automatically in `.deb` package)
 
 ## Installation
 
@@ -44,13 +44,33 @@ cargo build --release
 
 ### 2. Install binary
 
+From source:
+
 ```bash
 sudo cp target/release/proxy-jail /usr/local/bin/
 ```
 
-### 3. Configure passwordless sudo
+Or build a `.deb` package (recommended; the postinst script will register the
+sudoers rule for you, and `tun2socks` is bundled automatically):
 
-proxy-jail automatically elevates privileges via sudo when needed. Configure a sudoers rule so you won't be prompted for a password:
+```bash
+cargo install cargo-deb
+scripts/fetch-tun2socks.sh       # downloads tun2socks for current arch
+cargo deb --release
+sudo dpkg -i target/debian/proxy-jail_*.deb
+```
+
+When installing via `.deb`, the `postinst` automatically writes
+`/etc/sudoers.d/proxy-jail` so that all users can run `proxy-jail` without a
+password prompt. The file is removed on `apt purge` (but kept on `apt remove`).
+
+The `.deb` package also bundles the `tun2socks` binary at
+`/usr/lib/proxy-jail/tun2socks`, so no separate installation is needed.
+
+### 3. Configure passwordless sudo (only when installing from source)
+
+When installing the binary manually (without `.deb`), configure a sudoers rule
+so you won't be prompted for a password:
 
 ```bash
 echo "$USER ALL=(root) NOPASSWD: /usr/local/bin/proxy-jail" | sudo tee /etc/sudoers.d/proxy-jail
@@ -59,9 +79,11 @@ sudo chmod 440 /etc/sudoers.d/proxy-jail
 
 > **Note**: Only `proxy-jail` itself is allowed via sudoers. Individual `ip`, `iptables` commands are not exposed — they run internally within proxy-jail after privilege elevation.
 
-The `tun2socks` binary also needs capabilities:
+You will also need a `tun2socks` binary on your `$PATH`:
 ```bash
-sudo setcap cap_net_admin+ep /path/to/tun2socks
+# Download from https://github.com/xjasonlyu/tun2socks/releases/tag/v2.7.0
+# and place the binary somewhere in $PATH, e.g.:
+sudo cp tun2socks /usr/local/bin/
 ```
 
 ## Usage

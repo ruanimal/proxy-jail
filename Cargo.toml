@@ -2,6 +2,7 @@
 name = "proxy-jail"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Force GUI applications through SOCKS5 proxy using network namespaces"
 
 [[bin]]
@@ -20,3 +21,24 @@ nix = { version = "0.29", features = ["process", "signal", "user", "fs", "sched"
 users = "0.11"
 libc = "0.2"
 dirs = "6"
+
+[package.metadata.deb]
+name = "proxy-jail"
+maintainer = "Proxy Jail Authors"
+copyright = "MIT"
+extended-description = """\
+Force GUI applications through SOCKS5 proxy using Linux network namespaces \
+and tun2socks. Provides per-application network isolation with transparent \
+proxying, no full root access required, and seamless desktop integration."""
+depends = "iproute2, iptables"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/proxy-jail", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/proxy-jail/README.md", "644"],
+    ["config.example.yaml", "usr/share/doc/proxy-jail/config.example.yaml", "644"],
+    ["target/fetch-tun2socks/tun2socks", "usr/lib/proxy-jail/tun2socks", "755"],
+]
+# 维护脚本：安装时写入 sudoers，卸载/清理时删除
+maintainer-scripts = "debian/"
+

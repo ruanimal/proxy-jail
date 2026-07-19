@@ -6,6 +6,21 @@ use tracing::{debug, info, warn};
 
 use crate::config::JailConfig;
 
+/// Canonical install path of the bundled tun2socks binary (inside the .deb).
+const TUN2SOCKS_DEB_PATH: &str = "/usr/lib/proxy-jail/tun2socks";
+
+/// Resolve the path to the tun2socks binary.
+///
+/// If the binary was installed via .deb, prefer that path.  Otherwise fall
+/// back to `tun2socks` on `$PATH` (works for manual installs / `cargo build`).
+fn tun2socks_bin() -> &'static str {
+    if Path::new(TUN2SOCKS_DEB_PATH).exists() {
+        TUN2SOCKS_DEB_PATH
+    } else {
+        "tun2socks"
+    }
+}
+
 /// Start tun2socks process in the network namespace
 pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
     let netns_name = jail.netns_name();
@@ -45,13 +60,14 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
 
     info!("Starting tun2socks in namespace: {} -> {}", netns_name, proxy_url);
 
-    // Start tun2socks using command-line arguments (more reliable than config file)
-    // Use sudo since we're no longer running as root (the program runs as the
-    // real user and only elevates for privileged operations).
+    // Start tun2socks using command-line arguments (more reliable than config file).
+    // Runs inside the namespace as root (via sudo ip netns exec), so no
+    // setcap is needed on the tun2socks binary itself.
+    let tun2socks = tun2socks_bin();
     let child = Command::new("sudo")
         .args(&[
             "ip", "netns", "exec", &netns_name,
-            "tun2socks",
+            tun2socks,
             "-device", "tun://tun0",
             "-proxy", &proxy_url,
             "-loglevel", "info",
@@ -59,7 +75,12 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("Failed to start tun2socks. Is it installed?")?;
+        .with_context(|| {
+            format!(
+                "Failed to start tun2socks at '{}'. Is it installed?",
+                tun2socks,
+            )
+        })?;
 
     let pid = child.id();
 

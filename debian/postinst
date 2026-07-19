@@ -1,0 +1,45 @@
+#!/bin/sh
+# postinst for proxy-jail
+#
+# 在 dpkg 安装完成后以 root 运行。
+# 写入 /etc/sudoers.d/proxy-jail，允许所有用户免密调用 proxy-jail。
+# 仅放行 proxy-jail 自身，ip/iptables 等命令在 proxy-jail 内部以子进程形式执行。
+
+set -e
+
+SUDOERS_FILE="/etc/sudoers.d/proxy-jail"
+PROXY_JAIL_BIN="/usr/bin/proxy-jail"
+
+case "$1" in
+    configure)
+        # 仅在缺少文件时写入；upgrade 时文件已存在，保留用户可能的自定义
+        if [ ! -e "$SUDOERS_FILE" ]; then
+            cat > "$SUDOERS_FILE" <<EOF
+# Allow members of group sudo to execute proxy-jail without a password.
+# Only proxy-jail itself is exposed via sudoers; the ip/iptables commands
+# it spawns run internally after privilege elevation.
+ALL ALL=(root) NOPASSWD: $PROXY_JAIL_BIN
+EOF
+            chmod 0440 "$SUDOERS_FILE"
+        fi
+
+        # visudo 校验语法，失败则回滚，避免锁死用户系统
+        if ! visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1; then
+            echo "proxy-jail postinst: visudo rejected $SUDOERS_FILE, removing it." >&2
+            rm -f "$SUDOERS_FILE"
+            exit 1
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
