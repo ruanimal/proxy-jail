@@ -4,7 +4,21 @@ use tracing::{debug, info};
 
 use crate::config::JailConfig;
 
-/// Launch an application inside a network namespace
+/// Launch an application inside a network namespace.
+///
+/// # Prerequisites
+///
+/// This function only performs `nsenter` + `su` + `exec` and does **not**
+/// ensure the jail is ready. The caller is responsible for guaranteeing:
+///
+/// 1. The network namespace `pj-{name}` exists (see [`crate::network::create_jail_network`]).
+/// 2. `tun2socks` is running inside the namespace
+///    (see [`crate::proxy::check_tun2socks_running`] /
+///    [`crate::proxy::start_tun2socks`]).
+///
+/// Both prerequisites are satisfied by [`crate::jail::run_app`], which is
+/// the only intended entry point in production. Call this function directly
+/// only from tests or trusted internal code paths.
 pub fn launch_app(jail: &JailConfig, command: &str, args: &[String]) -> Result<()> {
     let netns_name = jail.netns_name();
 
