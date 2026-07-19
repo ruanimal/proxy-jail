@@ -162,6 +162,63 @@ jails:
 5. **NAT**: Adds iptables MASQUERADE rule on the host to forward traffic
 6. **Application launch**: Enters the namespace, drops privileges, and executes the application
 
+## Reaching services inside a jail
+
+When you `app exec` a server (e.g. `python -m http.server`), the service
+listens on a veth IP *inside* the netns (e.g. `10.10.0.2`).  That IP is
+reachable from the host — find it in `jail list`:
+
+```text
+NAME             PROXY                STATUS          NETNS IP
+work             socks5://...:1080    Running         10.10.0.2
+```
+
+proxy-jail does **not** auto-forward ports.  You forward them yourself
+with `socat` (or `ssh -L`) so you stay in control of *which* ports are
+exposed and *where* on the host they bind.
+
+### From the host (loopback only)
+
+```bash
+# Forward host 127.0.0.1:8000 → 10.10.0.2:8000
+socat TCP-LISTEN:8000,bind=127.0.0.1,fork,reuseaddr TCP:10.10.0.2:8000
+```
+
+### From the LAN (bind on all interfaces)
+
+```bash
+socat TCP-LISTEN:8000,bind=0.0.0.0,fork,reuseaddr TCP:10.10.0.2:8000
+```
+
+### From a remote host via SSH
+
+```bash
+# Run on the *remote* machine — proxies through the host running proxy-jail
+ssh -L 8000:10.10.0.2:8000 user@proxy-jail-host
+```
+
+### Run a command inside the netns (most direct)
+
+```bash
+# Whatever you run here sees the same network as the jailed app
+sudo ip netns exec pj-work curl http://localhost:8000
+```
+
+### Future: `jail expose` (planned, not implemented yet)
+
+A convenience wrapper around the `socat` invocations above is on the
+roadmap:
+
+```bash
+# Today:  copy-paste the socat command
+# Future:  proxy-jail jail expose --jail work --bind 127.0.0.1:8000 --to 8000
+```
+
+The wrapper would just be a thin shortcut — it still spawns `socat`
+under the hood, doesn't auto-detect ports, and stays independent of
+`app exec` so you can expose a port even when the app is started some
+other way.
+
 ## Security considerations
 
 - Privileged operations use sudo with a scoped sudoers rule (no full root access)

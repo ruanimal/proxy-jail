@@ -59,8 +59,8 @@ pub fn list_jails(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<15} {:<20} {:<15}", "NAME", "PROXY", "STATUS");
-    println!("{:-<15} {:-<20} {:-<15}", "", "", "");
+    println!("{:<15} {:<20} {:<15} {:<16}", "NAME", "PROXY", "STATUS", "NETNS IP");
+    println!("{:-<15} {:-<20} {:-<15} {:-<16}", "", "", "", "");
 
     for jail in &config.jails {
         let status = if network::netns_exists(&jail.netns_name()) {
@@ -75,10 +75,20 @@ pub fn list_jails(config: &Config) -> Result<()> {
 
         let proxy_addr = jail.proxy.socks5_addr();
 
-        println!("{:<15} {:<20} {:<15}",
+        // Show the veth IP inside the netns only when the netns is up
+        // — otherwise there's nothing to connect to.
+        let ns_ip = if network::netns_exists(&jail.netns_name()) {
+            let subnet = jail.get_subnet(&config.jails);
+            network::get_ns_ip(&subnet).unwrap_or_else(|_| "-".into())
+        } else {
+            "-".to_string()
+        };
+
+        println!("{:<15} {:<20} {:<15} {:<16}",
             jail.name,
             proxy_addr,
-            status
+            status,
+            ns_ip,
         );
     }
 
@@ -175,7 +185,7 @@ pub fn run_app(
     // released before `launch_app` because that call blocks until the
     // user's command exits (e.g. a long-running server). Holding the lock
     // would prevent other commands from running in the same jail.
-    {
+    let subnet = {
         let _lock = acquire_lock(jail)?;
 
         // Lazy initialization: create network if it doesn't exist
@@ -190,7 +200,21 @@ pub fn run_app(
             let subnet = jail.get_subnet(&config.jails);
             proxy::start_tun2socks(jail, &subnet)?;
         }
-    } // lock released here
+
+        jail.get_subnet(&config.jails)
+    }; // lock released here
+
+    // Print a hint about how to reach services running inside the
+    // netns.  We don't forward any ports automatically — the user runs
+    // `socat` (or `ssh -L`) themselves.  See README for details.
+    if let Ok(ns_ip) = network::get_ns_ip(&subnet) {
+        info!(
+            "Netns '{}' is up. To reach services inside it from the host:\n  \
+             socat TCP-LISTEN:<host_port>,bind=127.0.0.1,fork,reuseaddr TCP:{}:<ns_port>",
+            jail.netns_name(),
+            ns_ip,
+        );
+    }
 
     // Launch the application (blocks until the command finishes)
     crate::launcher::launch_app(jail, command, args)?;

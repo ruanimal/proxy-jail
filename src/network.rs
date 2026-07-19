@@ -174,6 +174,14 @@ pub fn get_gateway(subnet: &str) -> Result<String> {
     increment_ip(&network_addr, 1)
 }
 
+/// Get the veth IP inside the network namespace (second usable IP).
+/// This is the destination address used when forwarding a host port
+/// back into the netns (e.g. by `expose::spawn_forwarder`).
+pub fn get_ns_ip(subnet: &str) -> Result<String> {
+    let (network_addr, _) = parse_subnet(subnet)?;
+    increment_ip(&network_addr, 2)
+}
+
 /// Get the host's real DNS server configuration
 /// Reads from /run/systemd/resolve/resolv.conf (upstream DNS) or falls back to parsing resolvectl
 fn get_host_dns() -> Result<String> {
