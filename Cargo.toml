@@ -1,6 +1,6 @@
 [package]
 name = "proxy-jail"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Force GUI applications through SOCKS5 proxy using network namespaces"
