@@ -13,6 +13,7 @@ use crate::dns_process;
 use crate::network;
 use crate::output;
 use crate::proxy;
+use crate::security;
 
 /// Create a new jail
 pub fn create_jail(
@@ -58,10 +59,14 @@ pub fn create_jail(
     // Add to config and save
     config.add_jail(jail)?;
 
-    let jail = config.find_jail(name)
+    let jail = config
+        .find_jail(name)
         .with_context(|| format!("Created jail '{}' is missing from configuration", name))?;
     let subnet = jail.get_subnet(&config.jails)?;
-    eprintln!("{}", output::jail_summary(jail, &subnet, "created (not started)", None)?);
+    eprintln!(
+        "{}",
+        output::jail_summary(jail, &subnet, "created (not started)", None)?
+    );
     eprintln!("  Config:    {}", crate::config::config_path().display());
     eprintln!("Start: proxy-jail jail start {}", name);
     eprintln!("Run:   proxy-jail app exec --jail {} -- <command>", name);
@@ -70,14 +75,21 @@ pub fn create_jail(
 }
 
 fn dns_summary(jail: &JailConfig) -> String {
-    let servers = jail.effective_dns_servers().iter()
-        .map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let servers = jail
+        .effective_dns_servers()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let search = if jail.dns_search.is_empty() {
         "(none)".to_string()
     } else {
         jail.dns_search.join(", ")
     };
-    format!("Jail '{}':\n  DNS servers: {}\n  DNS search:  {}\n  DNS path:    tun0 -> SOCKS5\n", jail.name, servers, search)
+    format!(
+        "Jail '{}':\n  DNS servers: {}\n  DNS search:  {}\n  DNS path:    tun0 -> SOCKS5\n",
+        jail.name, servers, search
+    )
 }
 
 /// With no changes, display DNS; otherwise save and refresh the existing netns.
@@ -88,7 +100,8 @@ pub fn configure_jail_dns(
     reset_servers: bool,
     config: &mut Config,
 ) -> Result<()> {
-    let jail = config.find_jail(name)
+    let jail = config
+        .find_jail(name)
         .with_context(|| format!("Jail '{name}' not found"))?;
     if servers.is_none() && search.is_none() && !reset_servers {
         jail.validate_dns()?;
@@ -98,13 +111,17 @@ pub fn configure_jail_dns(
 
     let _lock = acquire_lock(jail)?;
     config.update_jail_dns(name, servers, search, reset_servers)?;
-    let jail = config.find_jail(name)
+    let jail = config
+        .find_jail(name)
         .with_context(|| format!("Updated jail '{name}' is missing from configuration"))?;
-    if network::netns_exists(&jail.netns_name()) && proxy::check_tun2socks_running(jail)?.is_some() {
+    if network::netns_exists(&jail.netns_name()) && proxy::check_tun2socks_running(jail)?.is_some()
+    {
         dns_process::ensure_ready(jail).with_context(|| format!(
             "DNS configuration for '{name}' was saved, but could not be applied; retry `proxy-jail jail start {name}`"
         ))?;
-        eprintln!("DNS for jail '{name}' saved and applied in place; applications were not restarted.");
+        eprintln!(
+            "DNS for jail '{name}' saved and applied in place; applications were not restarted."
+        );
     } else {
         eprintln!("DNS for jail '{name}' saved; it will be applied when the jail starts.");
     }
@@ -150,7 +167,8 @@ pub fn list_jails(config: &Config) -> Result<()> {
 
 /// Start a jail (create network namespace + start tun2socks)
 pub fn start_jail(name: &str, config: &Config) -> Result<()> {
-    let jail = config.find_jail(name)
+    let jail = config
+        .find_jail(name)
         .with_context(|| format!("Jail '{}' not found", name))?;
 
     info!("Starting jail: {}", name);
@@ -160,17 +178,19 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
 
     // Reload under the jail lock so a concurrent DNS update is not reverted.
     let current = Config::load()?;
-    let jail = current.find_jail(name)
+    let jail = current
+        .find_jail(name)
         .with_context(|| format!("Jail '{name}' not found"))?;
     let config = &current;
     let netns_exists = network::netns_exists(&jail.netns_name());
 
-    if netns_exists
-        && let Some(pid) = proxy::check_tun2socks_running(jail)?
-    {
+    if netns_exists && let Some(pid) = proxy::check_tun2socks_running(jail)? {
         let subnet = jail.get_subnet(&config.jails)?;
         dns_process::ensure_ready(jail)?;
-        eprintln!("{}", output::jail_summary(jail, &subnet, "already running", Some(pid))?);
+        eprintln!(
+            "{}",
+            output::jail_summary(jail, &subnet, "already running", Some(pid))?
+        );
         return Ok(());
     }
 
@@ -195,13 +215,17 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
             jail.runtime_dir().join("tun2socks.log").display(),
         )
     })?;
-    eprintln!("{}", output::jail_summary(jail, &subnet, "started", Some(pid))?);
+    eprintln!(
+        "{}",
+        output::jail_summary(jail, &subnet, "started", Some(pid))?
+    );
     Ok(())
 }
 
 /// Stop the jail network; return whether a namespace or proxy was running.
 pub fn stop_jail(name: &str, config: &Config) -> Result<bool> {
-    let jail = config.find_jail(name)
+    let jail = config
+        .find_jail(name)
         .with_context(|| format!("Jail '{}' not found", name))?;
 
     info!("Stopping jail: {}", name);
@@ -257,16 +281,17 @@ pub fn delete_jail(name: &str, config: &mut Config) -> Result<()> {
 }
 
 /// Run an application in a jail
-pub fn run_app(
-    jail_name: &str,
-    command: &str,
-    args: &[String],
-    config: &Config,
-) -> Result<()> {
-    let jail = config.find_jail(jail_name)
+pub fn run_app(jail_name: &str, command: &str, args: &[String], config: &Config) -> Result<()> {
+    let jail = config
+        .find_jail(jail_name)
         .with_context(|| format!("Jail '{}' not found", jail_name))?;
 
-    info!("Running application in jail '{}': {} {}", jail_name, command, args.join(" "));
+    info!(
+        "Running application in jail '{}': {} {}",
+        jail_name,
+        command,
+        args.join(" ")
+    );
 
     // Acquire lock only for the initialization phase. The lock must be
     // released before `launch_app` because that call blocks until the
@@ -278,7 +303,8 @@ pub fn run_app(
         // Reload after acquiring the jail lock, so DNS changes aren't reverted
         // by a command which read the config while another update was running.
         let current = Config::load()?;
-        let jail = current.find_jail(jail_name)
+        let jail = current
+            .find_jail(jail_name)
             .with_context(|| format!("Jail '{}' not found", jail_name))?;
         if !network::netns_exists(&jail.netns_name()) {
             eprintln!("Initializing jail '{}'...", jail_name);
@@ -335,7 +361,10 @@ pub fn run_app(
         }
     };
 
-    eprintln!("{}", output::app_registered(jail_name, &record.app_name, &record.app_id, record.pid));
+    eprintln!(
+        "{}",
+        output::app_registered(jail_name, &record.app_name, &record.app_id, record.pid)
+    );
 
     // Block until the user-facing process exits, then forward status.
     let result = crate::launcher::wait_app(&mut handle);
@@ -392,8 +421,8 @@ fn generate_app_id() -> Result<String> {
     use std::io::Read;
 
     let mut bytes = [0u8; 8];
-    let mut f = File::open("/dev/urandom")
-        .context("Failed to open /dev/urandom to generate app id")?;
+    let mut f =
+        File::open("/dev/urandom").context("Failed to open /dev/urandom to generate app id")?;
     f.read_exact(&mut bytes)
         .context("Failed to read from /dev/urandom")?;
     Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
@@ -429,14 +458,13 @@ pub fn register_app(
     };
 
     let dir = jail.apps_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create apps dir: {:?}", dir))?;
+    security::private_directory(&dir)?;
 
     let path = record.file_path(jail);
-    let json = serde_json::to_string_pretty(&record)
-        .context("Failed to serialize AppRecord")?;
-    let mut f = File::create(&path)
-        .with_context(|| format!("Failed to create app record file: {:?}", path))?;
+    let json = serde_json::to_string_pretty(&record).context("Failed to serialize AppRecord")?;
+    let mut f = security::private_file(&path, false)
+        .with_context(|| format!("Failed to create app record file: {path:?}"))?;
+    f.set_len(0)?;
     f.write_all(json.as_bytes())
         .with_context(|| format!("Failed to write app record file: {:?}", path))?;
     f.sync_all().ok();
@@ -465,8 +493,8 @@ pub fn load_apps(jail: &JailConfig) -> Result<Vec<AppRecord>> {
     }
 
     let mut records = Vec::new();
-    for entry in fs::read_dir(&dir)
-        .with_context(|| format!("Failed to read apps dir: {:?}", dir))?
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("Failed to read apps dir: {:?}", dir))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -474,7 +502,7 @@ pub fn load_apps(jail: &JailConfig) -> Result<Vec<AppRecord>> {
             continue;
         }
 
-        let content = match fs::read_to_string(&path) {
+        let content = match security::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 warn!("Cannot read app record {:?}: {}", path, e);
@@ -664,14 +692,18 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
 /// (and the `sudo`/`ip` wrapper chain), which can cause the `stop`
 /// command to kill its own ancestors.
 pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
-    let jail = config.find_jail(jail_name)
+    let jail = config
+        .find_jail(jail_name)
         .with_context(|| format!("Jail '{}' not found", jail_name))?;
 
     info!("Stopping application '{}' in jail '{}'", query, jail_name);
 
     // Skip if the jail has not been initialized yet (no netns).
     if !network::netns_exists(&jail.netns_name()) {
-        eprintln!("Jail '{}' is not running; no application was signalled.", jail_name);
+        eprintln!(
+            "Jail '{}' is not running; no application was signalled.",
+            jail_name
+        );
         return Ok(());
     }
 
@@ -688,7 +720,10 @@ pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
     pids.dedup();
 
     if pids.is_empty() {
-        eprintln!("No processes found for '{}' in jail '{}'.", query, jail_name);
+        eprintln!(
+            "No processes found for '{}' in jail '{}'.",
+            query, jail_name
+        );
         return Ok(());
     }
 
@@ -709,13 +744,20 @@ pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
     }
 
     if signalled > 0 {
-        let ids = targets.iter().map(|record| record.app_id.as_str()).collect::<Vec<_>>().join(", ");
+        let ids = targets
+            .iter()
+            .map(|record| record.app_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         eprintln!(
             "Sent SIGTERM to {} process(es) for APP_ID={} in jail '{}'.",
             signalled, ids, jail_name,
         );
     } else {
-        eprintln!("Application '{}' in jail '{}' has already exited.", query, jail_name);
+        eprintln!(
+            "Application '{}' in jail '{}' has already exited.",
+            query, jail_name
+        );
     }
     Ok(())
 }
@@ -737,8 +779,7 @@ fn initialize_jail(jail: &JailConfig, config: &Config) -> Result<()> {
 
     // Create runtime directory
     let runtime_dir = jail.runtime_dir();
-    fs::create_dir_all(&runtime_dir)
-        .with_context(|| format!("Failed to create runtime directory: {:?}", runtime_dir))?;
+    security::private_directory(&runtime_dir)?;
 
     // Create network
     network::create_jail_network(jail, &subnet)?;
@@ -756,17 +797,18 @@ fn acquire_lock(jail: &JailConfig) -> Result<Flock<File>> {
 
     // Create parent directory if it doesn't exist
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create lock directory: {:?}", parent))?;
+        security::private_directory(parent)?;
     }
-
-    let file = File::create(&lock_path)
-        .with_context(|| format!("Failed to create lock file: {:?}", lock_path))?;
+    let file = security::private_file(&lock_path, false)
+        .with_context(|| format!("Failed to create lock file: {lock_path:?}"))?;
 
     // Try to acquire an exclusive lock (non-blocking)
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(lock),
-        Err((_, _)) => anyhow::bail!("Another instance is already running for jail '{}'", jail.name),
+        Err((_, _)) => anyhow::bail!(
+            "Another instance is already running for jail '{}'",
+            jail.name
+        ),
     }
 }
 
@@ -777,8 +819,8 @@ fn parse_socks5_addr(addr: &str) -> Result<crate::config::ProxyConfig> {
     } else {
         format!("socks5://{addr}")
     };
-    let parsed = url::Url::parse(&uri)
-        .map_err(|_| anyhow::anyhow!("Invalid SOCKS5 proxy address"))?;
+    let parsed =
+        url::Url::parse(&uri).map_err(|_| anyhow::anyhow!("Invalid SOCKS5 proxy address"))?;
     if matches!(parsed.host(), Some(url::Host::Ipv6(_))) {
         anyhow::bail!("IPv6 SOCKS5 proxy addresses are not supported");
     }
@@ -789,7 +831,9 @@ fn parse_socks5_addr(addr: &str) -> Result<crate::config::ProxyConfig> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        anyhow::bail!("Expected a SOCKS5 proxy address with host and port, without path, query, or fragment");
+        anyhow::bail!(
+            "Expected a SOCKS5 proxy address with host and port, without path, query, or fragment"
+        );
     }
 
     let auth = if parsed.username().is_empty() && parsed.password().is_none() {
@@ -850,8 +894,7 @@ mod tests {
             assert!(proxy.auth.is_none());
         }
         let proxy =
-            parse_socks5_addr("socks5://user%40name:p%3Ass%2540@proxy.example.com:1080")
-                .unwrap();
+            parse_socks5_addr("socks5://user%40name:p%3Ass%2540@proxy.example.com:1080").unwrap();
         assert_eq!(proxy.host, "proxy.example.com");
         let config_yaml = serde_yaml::to_string(&proxy).unwrap();
         let proxy: crate::config::ProxyConfig = serde_yaml::from_str(&config_yaml).unwrap();
@@ -1051,7 +1094,10 @@ mod signal_tests {
     #[test]
     fn sending_sigterm_reports_success_for_an_owned_child() {
         use std::os::unix::process::ExitStatusExt;
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         assert!(terminate_app_process(child.id() as i32).unwrap());
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
     }

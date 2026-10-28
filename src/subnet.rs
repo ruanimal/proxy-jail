@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::net::Ipv4Addr;
-use std::process::Command;
 
 /// An uncommon RFC 1918 pool; only individual /30 routes are installed.
 pub const DEFAULT_POOL: &str = "10.203.240.0/20";
@@ -61,7 +60,7 @@ pub fn allocate(occupied: &[Ipv4Subnet], ordinal: usize) -> Result<String> {
 
 /// Include all routing tables so LAN, container and policy/VPN routes count.
 pub fn host_ipv4_subnets() -> Result<Vec<Ipv4Subnet>> {
-    let output = Command::new("ip")
+    let output = crate::security::command("ip")?
         .args(["-j", "-4", "route", "show", "table", "all"])
         .output()
         .context("Failed to inspect host IPv4 routes")?;

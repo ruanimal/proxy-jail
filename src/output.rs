@@ -49,8 +49,21 @@ pub fn jail_summary(
 pub fn jail_table_header() -> String {
     format!(
         "{:<15} {:<22} {:<10} {:<20} {:<15} {:<15} {:<31} DNS SEARCH\n{:-<15} {:-<22} {:-<10} {:-<20} {:-<15} {:-<15} {:-<31} {:-<20}",
-        "NAME", "PROXY", "STATUS", "SUBNET", "GATEWAY", "NETNS IP", "DNS",
-        "", "", "", "", "", "", "", "",
+        "NAME",
+        "PROXY",
+        "STATUS",
+        "SUBNET",
+        "GATEWAY",
+        "NETNS IP",
+        "DNS",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
     )
 }
 
@@ -61,8 +74,12 @@ pub fn jail_table_row(jail: &JailConfig, subnet: &str, status: &str) -> Result<S
     } else {
         network::get_ns_ip(subnet)?
     };
-    let dns = jail.effective_dns_servers().iter()
-        .map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let dns = jail
+        .effective_dns_servers()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let dns_search = if jail.dns_search.is_empty() {
         "-".to_string()
     } else {
@@ -190,12 +207,18 @@ mod tests {
             "192.168.100.101".parse().unwrap(),
             "192.168.100.102".parse().unwrap(),
         ]);
-        jail.dns_search = vec!["corp.example".to_string(), "long.internal.example".to_string()];
+        jail.dns_search = vec![
+            "corp.example".to_string(),
+            "long.internal.example".to_string(),
+        ];
         for state in ["Running", "Partial", "Stopped"] {
             let row = jail_table_row(&jail, "10.203.240.4/30", state).unwrap();
             let columns: Vec<_> = row.split_whitespace().collect();
             assert_eq!(columns.len(), 8);
-            assert_eq!(columns[6], "192.168.100.100,192.168.100.101,192.168.100.102");
+            assert_eq!(
+                columns[6],
+                "192.168.100.100,192.168.100.101,192.168.100.102"
+            );
             assert_eq!(columns[7], "corp.example,long.internal.example");
             assert!(!row.contains("private-user"));
             assert!(!row.contains("private-password"));

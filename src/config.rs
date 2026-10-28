@@ -1,37 +1,59 @@
 use anyhow::{Context, Result, ensure};
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+use std::io::Write;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use users::os::unix::UserExt;
 
+use crate::security;
 use crate::subnet::{self, Ipv4Subnet};
 
-const DEFAULT_DNS_SERVERS: [Ipv4Addr; 2] = [
-    Ipv4Addr::new(1, 1, 1, 1),
-    Ipv4Addr::new(8, 8, 8, 8),
-];
+/// veth-h-/veth-n- take seven bytes of Linux's 15-byte interface limit.
+pub fn parse_jail_name(name: &str) -> std::result::Result<String, String> {
+    if name.is_empty()
+        || name.len() > 8
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        || !name.as_bytes()[0].is_ascii_alphanumeric()
+    {
+        return Err("Jail name must be 1-8 ASCII letters, digits, '_' or '-', starting with a letter or digit".into());
+    }
+    Ok(name.to_string())
+}
+
+const DEFAULT_DNS_SERVERS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
 
 /// Shared validation for command-line values and YAML configurations.
 pub fn parse_dns_server(value: &str) -> std::result::Result<Ipv4Addr, String> {
-    let server = value.parse::<Ipv4Addr>()
+    let server = value
+        .parse::<Ipv4Addr>()
         .map_err(|_| format!("Invalid IPv4 DNS server: {value}"))?;
-    if server.is_unspecified() || server.is_loopback()
-        || server.is_multicast() || server.is_broadcast()
+    if server.is_unspecified()
+        || server.is_loopback()
+        || server.is_multicast()
+        || server.is_broadcast()
     {
-        return Err(format!("DNS server {server} cannot be reached through the jail's TUN/SOCKS5"));
+        return Err(format!(
+            "DNS server {server} cannot be reached through the jail's TUN/SOCKS5"
+        ));
     }
     Ok(server)
 }
 
 pub fn parse_dns_search_domain(domain: &str) -> std::result::Result<String, String> {
     let name = domain.strip_suffix('.').unwrap_or(domain);
-    let valid = !name.is_empty() && domain.len() <= 253 && name.split('.').all(|label| {
-        !label.is_empty() && label.len() <= 63
-            && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    });
+    let valid = !name.is_empty()
+        && domain.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        });
     if !valid {
         return Err(format!("Invalid DNS search domain: {domain:?}"));
     }
@@ -58,22 +80,12 @@ pub fn config_path() -> PathBuf {
         .join("config.yaml")
 }
 
-/// Get the runtime directory used for each jail's process state.
+/// Privileged state never lives in caller-controlled XDG_RUNTIME_DIR or /tmp.
 pub fn runtime_base_dir() -> PathBuf {
-    dirs::runtime_dir()
-        .or_else(|| {
-            // sudo without -E may remove XDG_RUNTIME_DIR, but SUDO_UID still
-            // identifies the user's existing systemd runtime directory.
-            let uid = std::env::var("SUDO_UID").ok()?.parse::<u32>().ok()?;
-            runtime_dir_for_uid(Path::new("/run/user"), uid)
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp").join(format!("proxy-jail-{}", users::get_current_uid())))
-}
-
-fn runtime_dir_for_uid(base: &Path, uid: u32) -> Option<PathBuf> {
-    let path = base.join(uid.to_string());
-    let metadata = std::fs::symlink_metadata(&path).ok()?;
-    (metadata.is_dir() && metadata.uid() == uid).then_some(path)
+    let uid = security::invoking_user()
+        .map(|user| user.uid.as_raw())
+        .unwrap_or_else(|_| users::get_current_uid());
+    PathBuf::from("/run/proxy-jail").join(uid.to_string())
 }
 
 /// User data directory for logs and desktop files
@@ -142,17 +154,17 @@ fn default_proxy_type() -> String {
 
 /// Keep the lock file in place: deleting it could create independent locks.
 fn lock_config(path: &Path) -> Result<Flock<File>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory: {parent:?}"))?;
+    if path == config_path() {
+        let user = security::invoking_user()?;
+        for directory in [
+            real_home().join(".config"),
+            path.parent().unwrap().to_path_buf(),
+        ] {
+            let file = security::directory(&directory, true, 0o700)?;
+            security::set_owner(&file, user.uid, user.gid)?;
+        }
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path.with_extension("lock"))
+    let file = security::private_file(&path.with_extension("lock"), false)
         .context("Failed to open configuration lock")?;
     Flock::lock(file, FlockArg::LockExclusive)
         .map_err(|(_, error)| error)
@@ -173,15 +185,21 @@ impl Config {
     }
 
     fn load_unlocked(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Config { jails: Vec::new() });
+        let content = match security::read_private(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Config { jails: Vec::new() });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read config file: {path:?}"));
+            }
+        };
+        let mut config: Config = serde_yaml::from_slice(&content)
+            .with_context(|| format!("Failed to parse config file: {path:?}"))?;
+        for jail in &config.jails {
+            parse_jail_name(&jail.name).map_err(anyhow::Error::msg)?;
+            jail.validate_dns()?;
         }
-
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {:?}", path))?;
-
-        let mut config: Config = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {:?}", path))?;
 
         // Migrate legacy configurations once so later removals do not change
         // the subnet of a jail whose network namespace is already running.
@@ -214,18 +232,17 @@ impl Config {
 
     /// Save configuration to file
     fn save_to(&self, path: &Path) -> Result<()> {
-
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
+        let content = serde_yaml::to_string(self).context("Failed to serialize config")?;
+        let mut file = security::private_file(path, false)
+            .with_context(|| format!("Failed to write config file: {path:?}"))?;
+        file.set_len(0)?;
+        file.write_all(content.as_bytes())?;
+        if path == config_path() {
+            let user = security::invoking_user()?;
+            security::set_owner(&file, user.uid, user.gid)?;
+            let directory = security::directory(path.parent().unwrap(), false, 0)?;
+            security::set_owner(&directory, user.uid, user.gid)?;
         }
-
-        let content = serde_yaml::to_string(self)
-            .context("Failed to serialize config")?;
-
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write config file: {:?}", path))?;
 
         Ok(())
     }
@@ -242,6 +259,7 @@ impl Config {
 
     /// Add a new jail
     pub fn add_jail(&mut self, jail: JailConfig) -> Result<()> {
+        parse_jail_name(&jail.name).map_err(anyhow::Error::msg)?;
         jail.validate_dns()?;
         let path = config_path();
         let _lock = lock_config(&path)?;
@@ -273,10 +291,14 @@ impl Config {
         search: Option<Vec<String>>,
         reset_servers: bool,
     ) -> Result<()> {
-        ensure!(!reset_servers || servers.is_none(), "Cannot set and reset DNS servers together");
+        ensure!(
+            !reset_servers || servers.is_none(),
+            "Cannot set and reset DNS servers together"
+        );
         let _lock = lock_config(path)?;
         let mut latest = Self::load_unlocked(path)?;
-        let jail = latest.find_jail_mut(name)
+        let jail = latest
+            .find_jail_mut(name)
             .with_context(|| format!("Jail '{name}' not found"))?;
         if reset_servers {
             jail.dns_servers = None;
@@ -312,7 +334,11 @@ impl JailConfig {
     }
 
     pub fn validate_dns(&self) -> Result<()> {
-        ensure!(!self.effective_dns_servers().is_empty(), "Jail '{}': dns_servers must not be empty", self.name);
+        ensure!(
+            !self.effective_dns_servers().is_empty(),
+            "Jail '{}': dns_servers must not be empty",
+            self.name
+        );
         for server in self.effective_dns_servers() {
             parse_dns_server(&server.to_string())
                 .map_err(anyhow::Error::msg)
@@ -415,8 +441,7 @@ impl ProxyConfig {
 /// Get the user's data directory
 #[allow(dead_code)]
 pub fn user_data_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .context("HOME environment variable not set")?;
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
     Ok(PathBuf::from(home).join(USER_DATA_DIR))
 }
 
@@ -430,6 +455,24 @@ pub fn log_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_reads_tighten_permissions_and_reject_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let (fixture, _) = DnsConfigFixture::new();
+        std::fs::set_permissions(&fixture.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Config::load_from(&fixture.path).unwrap();
+        assert_eq!(fixture.path.metadata().unwrap().mode() & 0o777, 0o600);
+        let linked = fixture.directory.join("linked.yaml");
+        symlink(&fixture.path, &linked).unwrap();
+        assert!(Config::load_from(&linked).is_err());
+        let hardlink = fixture.directory.join("hardlink.yaml");
+        std::fs::hard_link(&fixture.path, &hardlink).unwrap();
+        assert!(Config::load_from(&hardlink).is_err());
+        let lock_link = fixture.directory.join("unsafe.lock");
+        symlink(&fixture.path, &lock_link).unwrap();
+        assert!(lock_config(&fixture.directory.join("unsafe.yaml")).is_err());
+    }
+
     struct DnsConfigFixture {
         directory: PathBuf,
         path: PathBuf,
@@ -438,15 +481,23 @@ mod tests {
     impl DnsConfigFixture {
         fn new() -> (Self, Config) {
             let base = std::env::var_os("PI_SCRATCH_DIR")
-                .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-            let directory = base.join(format!("proxy-jail-dns-config-{}-{}",
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let directory = base.join(format!(
+                "proxy-jail-dns-config-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
             let path = directory.join("config.yaml");
-            let config = Config { jails: vec![
-                subnet_jail("xray", Some("10.203.240.0/30")),
-                subnet_jail("pp", Some("10.203.240.4/30")),
-            ] };
+            let config = Config {
+                jails: vec![
+                    subnet_jail("xray", Some("10.203.240.0/30")),
+                    subnet_jail("pp", Some("10.203.240.4/30")),
+                ],
+            };
             config.save_to(&path).unwrap();
             (Self { directory, path }, config)
         }
@@ -459,20 +510,41 @@ mod tests {
     }
 
     #[test]
-    fn sudo_runtime_fallback_requires_real_directory_owned_by_user() {
-        use std::os::unix::fs::symlink;
+    fn runtime_state_does_not_use_user_directories() {
+        let user = security::invoking_user().unwrap();
+        assert_eq!(
+            runtime_base_dir(),
+            PathBuf::from("/run/proxy-jail").join(user.uid.to_string())
+        );
+    }
+
+    #[test]
+    fn jail_names_reject_traversal_and_invalid_interface_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../work",
+            "/tmp",
+            "a/b",
+            "a\\b",
+            "bad name",
+            "-option",
+            "123456789",
+            "work\n",
+        ] {
+            assert!(parse_jail_name(name).is_err(), "{name:?}");
+        }
+        for name in ["work", "a_1-2", "12345678"] {
+            assert_eq!(parse_jail_name(name).unwrap(), name);
+        }
         let (fixture, _) = DnsConfigFixture::new();
-        let uid = users::get_current_uid();
-        let own = fixture.directory.join(uid.to_string());
-        std::fs::create_dir(&own).unwrap();
-        assert_eq!(runtime_dir_for_uid(&fixture.directory, uid), Some(own.clone()));
-        let other = uid + 1;
-        let foreign = fixture.directory.join(other.to_string());
-        std::fs::create_dir(&foreign).unwrap();
-        assert_eq!(runtime_dir_for_uid(&fixture.directory, other), None);
-        std::fs::remove_dir(&own).unwrap();
-        symlink(&foreign, &own).unwrap();
-        assert_eq!(runtime_dir_for_uid(&fixture.directory, uid), None);
+        std::fs::write(
+            &fixture.path,
+            "jails: [{name: '../bad', proxy: {host: gateway, port: 1080}}]",
+        )
+        .unwrap();
+        assert!(Config::load_from(&fixture.path).is_err());
     }
 
     #[test]
@@ -485,7 +557,9 @@ mod tests {
         concurrent.save_to(&fixture.path).unwrap();
         let ip = Ipv4Addr::new(10, 251, 1, 1);
 
-        config.update_jail_dns_at(&fixture.path, "pp", Some(vec![ip]), None, false).unwrap();
+        config
+            .update_jail_dns_at(&fixture.path, "pp", Some(vec![ip]), None, false)
+            .unwrap();
         let saved = Config::load_from(&fixture.path).unwrap();
         let pp = saved.find_jail("pp").unwrap();
         assert_eq!(pp.dns_servers, Some(vec![ip]));
@@ -500,15 +574,29 @@ mod tests {
     fn test_dns_search_update_preserves_servers_and_reset_preserves_search() {
         let (fixture, mut config) = DnsConfigFixture::new();
         let ip = Ipv4Addr::new(10, 251, 1, 1);
-        config.update_jail_dns_at(&fixture.path, "pp", Some(vec![ip]), None, false).unwrap();
-        config.update_jail_dns_at(&fixture.path, "pp", None, Some(vec!["corp.example".to_string()]), false).unwrap();
+        config
+            .update_jail_dns_at(&fixture.path, "pp", Some(vec![ip]), None, false)
+            .unwrap();
+        config
+            .update_jail_dns_at(
+                &fixture.path,
+                "pp",
+                None,
+                Some(vec!["corp.example".to_string()]),
+                false,
+            )
+            .unwrap();
         assert_eq!(config.find_jail("pp").unwrap().dns_servers, Some(vec![ip]));
-        config.update_jail_dns_at(&fixture.path, "pp", None, None, true).unwrap();
+        config
+            .update_jail_dns_at(&fixture.path, "pp", None, None, true)
+            .unwrap();
         let pp = config.find_jail("pp").unwrap();
         assert!(pp.dns_servers.is_none());
         assert_eq!(pp.dns_search, ["corp.example"]);
         assert_eq!(pp.effective_dns_servers(), DEFAULT_DNS_SERVERS);
-        config.update_jail_dns_at(&fixture.path, "pp", None, Some(Vec::new()), false).unwrap();
+        config
+            .update_jail_dns_at(&fixture.path, "pp", None, Some(Vec::new()), false)
+            .unwrap();
         assert!(config.find_jail("pp").unwrap().dns_search.is_empty());
     }
 
@@ -523,11 +611,19 @@ mod tests {
             (None, Some(vec!["bad domain".to_string()]), false),
             (Some(vec![Ipv4Addr::new(10, 251, 1, 1)]), None, true),
         ] {
-            assert!(config.update_jail_dns_at(&fixture.path, "pp", servers, search, reset).is_err());
+            assert!(
+                config
+                    .update_jail_dns_at(&fixture.path, "pp", servers, search, reset)
+                    .is_err()
+            );
             assert_eq!(std::fs::read(&fixture.path).unwrap(), original_file);
             assert_eq!(serde_yaml::to_string(&config).unwrap(), original_memory);
         }
-        assert!(config.update_jail_dns_at(&fixture.path, "missing", None, Some(Vec::new()), false).is_err());
+        assert!(
+            config
+                .update_jail_dns_at(&fixture.path, "missing", None, Some(Vec::new()), false)
+                .is_err()
+        );
         assert_eq!(std::fs::read(&fixture.path).unwrap(), original_file);
     }
 
@@ -565,11 +661,16 @@ mod tests {
         let directory = base.join(format!(
             "proxy-jail-config-lock-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let path = directory.join("config.yaml");
         let lock = lock_config(&path).unwrap();
-        let mut config = Config { jails: vec![subnet_jail("test", None)] };
+        let mut config = Config {
+            jails: vec![subnet_jail("test", None)],
+        };
         config.save_to(&path).unwrap();
 
         let (started_tx, started_rx) = mpsc::channel();
@@ -588,7 +689,10 @@ mod tests {
         config.jails[0].subnet = Some("10.203.240.0/30".to_string());
         config.save_to(&path).unwrap();
         drop(lock);
-        let loaded = loaded_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let loaded = loaded_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         loader.join().unwrap();
         assert_eq!(loaded.jails[0].subnet.as_deref(), Some("10.203.240.0/30"));
         std::fs::remove_dir_all(directory).unwrap();
@@ -626,7 +730,10 @@ mod tests {
         let jails = vec![subnet_jail("xray", None), subnet_jail("pp", None)];
         assert_eq!(allocated(&jails[0], &jails), "10.203.240.0/30");
         assert_eq!(allocated(&jails[1], &jails), "10.203.240.4/30");
-        assert_eq!(allocated(&subnet_jail("next", None), &jails), "10.203.240.8/30");
+        assert_eq!(
+            allocated(&subnet_jail("next", None), &jails),
+            "10.203.240.8/30"
+        );
     }
 
     #[test]
@@ -660,7 +767,10 @@ mod tests {
         let mut restored: Config = serde_yaml::from_str(&yaml).unwrap();
         restored.jails.remove(0);
         assert!(!restored.assign_missing_subnets_avoiding(&[]).unwrap());
-        assert_eq!(restored.jails[0].get_subnet(&restored.jails).unwrap(), "10.203.240.8/30");
+        assert_eq!(
+            restored.jails[0].get_subnet(&restored.jails).unwrap(),
+            "10.203.240.8/30"
+        );
         restored.jails.push(subnet_jail("next", None));
         assert!(restored.assign_missing_subnets_avoiding(&[]).unwrap());
         assert_eq!(restored.jails[2].subnet.as_deref(), Some("10.203.240.0/30"));
@@ -669,7 +779,10 @@ mod tests {
     #[test]
     fn test_legacy_explicit_subnets_are_not_migrated_automatically() {
         let mut config = Config {
-            jails: vec![subnet_jail("legacy", Some("10.10.0.0/24")), subnet_jail("new", None)],
+            jails: vec![
+                subnet_jail("legacy", Some("10.10.0.0/24")),
+                subnet_jail("new", None),
+            ],
         };
         assert!(config.assign_missing_subnets_avoiding(&[]).unwrap());
         assert_eq!(config.jails[0].subnet.as_deref(), Some("10.10.0.0/24"));
@@ -686,7 +799,9 @@ mod tests {
         assert_eq!(config.jails[0].subnet.as_deref(), Some("10.203.241.0/30"));
         assert_eq!(config.jails[1].subnet.as_deref(), Some("10.203.241.4/30"));
 
-        let mut config = Config { jails: vec![subnet_jail("blocked", None)] };
+        let mut config = Config {
+            jails: vec![subnet_jail("blocked", None)],
+        };
         let occupied = [Ipv4Subnet::parse(subnet::DEFAULT_POOL).unwrap()];
         assert!(config.assign_missing_subnets_avoiding(&occupied).is_err());
         assert!(config.jails[0].subnet.is_none());

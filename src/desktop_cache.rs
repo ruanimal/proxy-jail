@@ -14,16 +14,23 @@ struct RefreshReport {
 
 /// File changes have already succeeded, so cache failures are non-fatal.
 pub fn refresh(dir: &Path, home: &Path, owner: (Uid, Gid)) {
+    let environment = match crate::security::application_environment() {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("Warning: cannot read desktop session environment: {error}");
+            return;
+        }
+    };
     let kde = [
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_DESKTOP",
         "DESKTOP_SESSION",
     ]
     .iter()
-    .filter_map(|name| std::env::var(name).ok())
-    .any(|value| is_kde_session(&value));
-    let version = std::env::var("KDE_SESSION_VERSION").ok();
-    let report = refresh_with(dir, kde, version.as_deref(), |program, args| {
+    .filter_map(|name| environment.get(*name))
+    .any(|value| is_kde_session(value));
+    let version = environment.get("KDE_SESSION_VERSION");
+    let report = refresh_with(dir, kde, version.map(String::as_str), |program, args| {
         cache_command(program, args, home, owner)?.output()
     });
     for warning in report.warnings {
@@ -129,27 +136,25 @@ fn cache_command(
             "Cannot switch to the desktop entry owner",
         ));
     }
+    let user_info = nix::unistd::User::from_uid(owner.0)
+        .map_err(io::Error::from)?
+        .ok_or_else(|| io::Error::other("Cannot resolve desktop cache user"))?;
+    let environment = crate::launcher::user_environment(&user_info).map_err(io::Error::other)?;
     let mut command = Command::new(program);
     command
+        .env_clear()
+        .envs(environment)
         .args(args)
         .env("HOME", home)
         .env("USER", user.name())
-        .env("LOGNAME", user.name())
-        .env_remove("SUDO_UID")
-        .env_remove("SUDO_GID")
-        .env_remove("SUDO_USER");
+        .env("LOGNAME", user.name());
     if Uid::effective().is_root() {
         // SAFETY: only credential-changing syscalls run between fork and exec.
         // Clear inherited root groups before dropping GID and UID. The GUI
         // session environment is inherited, but HOME/USER above belong to the
         // invoking user rather than sudo's root account.
         unsafe {
-            command.pre_exec(move || {
-                nix::unistd::setgroups(&[]).map_err(io::Error::from)?;
-                nix::unistd::setgid(owner.1).map_err(io::Error::from)?;
-                nix::unistd::setuid(owner.0).map_err(io::Error::from)?;
-                Ok(())
-            });
+            command.pre_exec(move || crate::launcher::drop_to_user(owner.0, owner.1));
         }
     }
     Ok(command)

@@ -64,8 +64,13 @@ sudo dpkg -i target/debian/proxy-jail_*.deb
 ```
 
 When installing via `.deb`, the `postinst` automatically writes
-`/etc/sudoers.d/proxy-jail` so that all users can run `proxy-jail` without a
-password prompt. The file is removed on `apt purge` (but kept on `apt remove`).
+`/etc/sudoers.d/proxy-jail` so that members of the **sudo group** can run
+`proxy-jail` without a password prompt. Other users are not authorized by
+this rule. The file is removed on `apt purge` (but kept on `apt remove`).
+Package-generated legacy `ALL` rules are narrowed on upgrade; custom
+administrator rules are retained. The candidate policy is validated with
+`visudo` before atomically replacing the old file; validation failures keep
+the previous policy intact.
 
 The `.deb` package also bundles the `tun2socks` binary at
 `/usr/lib/proxy-jail/tun2socks`, so no separate installation is needed.
@@ -76,16 +81,26 @@ When installing the binary manually (without `.deb`), configure a sudoers rule
 so you won't be prompted for a password:
 
 ```bash
-echo "$USER ALL=(root) NOPASSWD: /usr/local/bin/proxy-jail" | sudo tee /etc/sudoers.d/proxy-jail
-sudo chmod 440 /etc/sudoers.d/proxy-jail
+sudo visudo -f /etc/sudoers.d/proxy-jail
 ```
+
+For a source installation at `/usr/local/bin/proxy-jail`, add:
+
+```sudoers
+Defaults!/usr/local/bin/proxy-jail env_reset
+Defaults!/usr/local/bin/proxy-jail env_keep += "PROXY_JAIL_APP_ENV"
+%sudo ALL=(root) NOPASSWD: NOSETENV: /usr/local/bin/proxy-jail
+```
+
+Install the binary and its parent directories as root-owned and not
+group/world-writable. Do not retain an older `ALL ... SETENV` rule.
 
 > **Note**: Only `proxy-jail` itself is allowed via sudoers. Individual `ip`, `iptables` commands are not exposed — they run internally within proxy-jail after privilege elevation. See [Privilege model](#privilege-model) for the full security boundary.
 
-You will also need a `tun2socks` binary on your `$PATH`:
+You will also need a root-owned `tun2socks` binary in `/usr/local/bin` or `/usr/bin`:
 ```bash
 # Download from https://github.com/xjasonlyu/tun2socks/releases/tag/v2.7.0
-# and place the binary somewhere in $PATH, e.g.:
+# and install it in a trusted system directory, e.g.:
 sudo cp tun2socks /usr/local/bin/
 ```
 
@@ -213,7 +228,19 @@ proxy-jail jail delete work
 
 ## Configuration
 
-Configuration is stored at `~/.config/proxy-jail/config.yaml` (respects `$XDG_CONFIG_HOME`). See `config.example.yaml` for the format.
+Configuration is stored at `~/.config/proxy-jail/config.yaml`. See
+`config.example.yaml` for the format. Jail names must be 1–8 ASCII letters,
+digits, `_` or `-`, starting with a letter or digit; the length also respects
+Linux's veth interface-name limit. Names are checked in both CLI arguments
+and existing YAML. Configuration and managed writable paths must not use
+symbolic links; privileged writes also reject hard-linked/non-regular files.
+
+Privileged runtime state is now stored under root-owned, mode-0700
+`/run/proxy-jail/<UID>/`, independent of `$XDG_RUNTIME_DIR` and `/tmp`.
+**Before upgrading from a version that used user runtime directories, stop
+all running jails with the old binary**, then install the update and start
+them again. Old PID files are intentionally not imported from user-writable
+directories. Relaunch applications after recreating their jail network.
 
 Automatic allocation uses consecutive `/30` subnets from `10.203.240.0/20`
 (for example, `10.203.240.0/30`, then `10.203.240.4/30`). Each has two usable
@@ -395,9 +422,9 @@ attack surface is the same `proxy-jail` binary, nothing more.
 
 | Aspect | Implementation |
 | --- | --- |
-| Root acquisition | `proxy-jail` re-execs itself via `sudo` (auto-installed by the `.deb`'s `postinst`) |
-| Sudoers rule | `/etc/sudoers.d/proxy-jail` grants `NOPASSWD: /usr/bin/proxy-jail` to all users |
-| What the rule permits | **Only** the `proxy-jail` binary — not `ip`, `iptables`, `tun2socks`, or `nsenter` |
+| Root acquisition | `proxy-jail` re-execs itself via `sudo -n`, without `-E` or preserving PATH |
+| Sudoers rule | `%sudo ALL=(root) NOPASSWD: NOSETENV: /usr/bin/proxy-jail` |
+| What the rule permits | Only the installed `proxy-jail` binary, not standalone system commands |
 | Lifetime | Created by `postinst`, removed on `apt purge`, kept on `apt remove` |
 | Application privilege | GUI apps run as the invoking user (`SUDO_UID`), not as root |
 
@@ -407,10 +434,10 @@ attack surface is the same `proxy-jail` binary, nothing more.
   user namespaces are used. The kernel does not need `CONFIG_USER_NS` for
   normal users, but `proxy-jail` itself always runs as real root while
   building the netns and starting `tun2socks`.
-- **Not a sandbox for untrusted code** — the same user that invokes
-  `proxy-jail` also gets root through it. Do not run this on a multi-user
-  host you do not control, or restrict the sudoers rule to specific users
-  (replace `ALL` with a user list in `/etc/sudoers.d/proxy-jail`).
+- **Not a sandbox for untrusted code** — authorized sudo-group members are
+  trusted administrators. This hardening does not provide a multi-user
+  security boundary or replace a minimal privileged helper. Other sudoers
+  rules on the host may independently grant additional privileges.
 - **Not a TTY-bound interactive sudo** — `proxy-jail` will refuse to prompt
   for a password. If you see `sudo: a password is required`, the sudoers
   rule is missing or `NOPASSWD` was dropped.
@@ -427,12 +454,15 @@ proxy-jail cannot currently do this. Alternatives that do:
 
 ## Security considerations
 
-- Privileged operations go through sudo with a scoped sudoers rule
-  (`NOPASSWD: /usr/bin/proxy-jail` only) — see [Privilege model](#privilege-model)
-- Configuration and runtime files are stored in user directories
-  (`~/.config/proxy-jail/`, `$XDG_RUNTIME_DIR/proxy-jail/`)
-- Applications run with dropped privileges (the invoking user via
-  `SUDO_UID`, not root)
+- Privileged operations use a sudo-group-only rule with `NOSETENV`.
+- System commands run from trusted root-owned paths with a clean environment.
+  The original GUI/toolchain environment is encoded as `PROXY_JAIL_APP_ENV`
+  and only installed in application/cache processes after dropping privileges.
+- Configuration is private (mode 0600); root-managed PID/lock/log state lives
+  under `/run/proxy-jail/<UID>/`, not user-controlled runtime directories.
+- Desktop deletion accepts only filenames for entries tagged with the selected
+  jail; paths, directory traversal and symlink targets are rejected.
+- Applications run with dropped privileges (the invoking user via `SUDO_UID`).
 - Network isolation is complete - no traffic leaks outside the proxy
 - DNS queries are also proxied (no DNS leaks)
 
@@ -454,7 +484,15 @@ cargo build
 
 ```bash
 cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+bash tests/postinst.sh
 ```
+
+The postinst tests use scratch files and real `visudo` validation, never the
+host sudoers policy. They require `sudo` (for `visudo`) plus root or enabled
+unprivileged user namespaces; unavailable prerequisites return exit code 77.
+Unit/CLI tests do not replace privileged network/desktop end-to-end testing.
 
 ### Releasing
 

@@ -113,3 +113,106 @@ fn invalid_or_conflicting_dns_arguments_fail_before_sudo() {
         assert!(!error.contains("Elevating privileges"));
     }
 }
+
+#[test]
+fn unsafe_names_and_desktop_paths_are_rejected_before_sudo() {
+    for args in [
+        vec!["jail", "start", "../bad"],
+        vec!["jail", "create", "123456789", "--socks5", "127.0.0.1:1080"],
+        vec!["app", "exec", "--jail", "a/b", "--", "true"],
+        vec!["desktop", "delete", "--jail", "work", "/etc/passwd"],
+        vec!["desktop", "delete", "--jail", "work", "../victim"],
+    ] {
+        let output = cli(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Elevating privileges"));
+    }
+}
+
+#[test]
+fn application_trampoline_restores_environment_without_elevation() {
+    let payload = serde_json::json!({
+        "PATH": "/custom/toolchain:/usr/bin:/bin",
+        "DISPLAY": ":test-display",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/test-bus",
+        "SUDO_UID": "0",
+        "HOME": "/wrong-home",
+        "MAIL": "/var/mail/root",
+        "TEST_VALUE": "spaces and symbols = stay intact"
+    })
+    .to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_proxy-jail"))
+        .args(["__run-app", "--", "/usr/bin/env"])
+        .env_clear()
+        .env("PROXY_JAIL_APP_ENV", payload)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let environment = String::from_utf8(output.stdout).unwrap();
+    assert!(environment.contains("PATH=/custom/toolchain:/usr/bin:/bin\n"));
+    assert!(environment.contains("DISPLAY=:test-display\n"));
+    assert!(environment.contains("DBUS_SESSION_BUS_ADDRESS=unix:path=/test-bus\n"));
+    assert!(environment.contains("TEST_VALUE=spaces and symbols = stay intact\n"));
+    assert!(!environment.contains("SUDO_"));
+    assert!(!environment.contains("PROXY_JAIL_APP_ENV="));
+    assert!(!environment.contains("HOME=/wrong-home"));
+    assert!(!environment.contains("MAIL="));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn invalid_application_environment_fails_without_executing_command() {
+    for payload in [
+        "not-json",
+        "{\"BAD=KEY\":\"value\"}",
+        "{\"KEY\":\"bad\\u0000value\"}",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_proxy-jail"))
+            .args(["__run-app", "--", "/bin/echo", "must-not-run"])
+            .env_clear()
+            .env("PROXY_JAIL_APP_ENV", payload)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn application_trampoline_preserves_stdin_and_user_path_lookup() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let base = std::env::var_os("PI_SCRATCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = base.join(format!("app-path-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let tool = directory.join("user-tool");
+    std::fs::write(&tool, "#!/bin/sh\n/usr/bin/id -u\n/bin/cat\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let payload = serde_json::json!({"PATH": directory.to_str().unwrap()}).to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_proxy-jail"))
+        .args(["__run-app", "--", "user-tool"])
+        .env_clear()
+        .env("PROXY_JAIL_APP_ENV", payload)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"stdin survives\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\nstdin survives\n", nix::unistd::getuid())
+    );
+    assert!(output.stderr.is_empty());
+    std::fs::remove_dir_all(directory).unwrap();
+}

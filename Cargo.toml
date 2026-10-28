@@ -32,7 +32,7 @@ extended-description = """\
 Force GUI applications through SOCKS5 proxy using Linux network namespaces \
 and tun2socks. Provides per-application network isolation with transparent \
 proxying, no full root access required, and seamless desktop integration."""
-depends = "iproute2 (>= 4.9), iptables"
+depends = "iproute2 (>= 4.9), iptables, sudo, util-linux"
 recommends = "desktop-file-utils"
 section = "net"
 priority = "optional"

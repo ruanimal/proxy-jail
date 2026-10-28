@@ -1,25 +1,31 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tracing::{debug, info, warn};
 
 use crate::config::JailConfig;
+use crate::security;
 
 /// Canonical install path of the bundled tun2socks binary (inside the .deb).
 const TUN2SOCKS_DEB_PATH: &str = "/usr/lib/proxy-jail/tun2socks";
 
-/// Resolve the path to the tun2socks binary.
-///
-/// If the binary was installed via .deb, prefer that path.  Otherwise fall
-/// back to `tun2socks` on `$PATH` (works for manual installs / `cargo build`).
-fn tun2socks_bin() -> &'static str {
+/// Only root-owned, non-writable system paths are eligible for root execution.
+fn tun2socks_bin() -> Result<PathBuf> {
     if Path::new(TUN2SOCKS_DEB_PATH).exists() {
-        TUN2SOCKS_DEB_PATH
-    } else {
-        "tun2socks"
+        return security::trusted_executable(Path::new(TUN2SOCKS_DEB_PATH));
     }
+    for path in [
+        "/usr/local/bin/tun2socks",
+        "/usr/bin/tun2socks",
+        "/bin/tun2socks",
+    ] {
+        if Path::new(path).exists() {
+            return security::trusted_executable(Path::new(path));
+        }
+    }
+    anyhow::bail!("Install tun2socks in /usr/local/bin or use the bundled .deb binary")
 }
 
 /// Start tun2socks process in the network namespace
@@ -40,10 +46,7 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
     // user specifies localhost/127.0.0.1/::1.  It means: resolve to the
     // host's gateway IP at runtime.
     let effective_proxy_host = if jail.proxy.host == "gateway" {
-        info!(
-            "Proxy host is 'gateway', resolving to {}",
-            gateway
-        );
+        info!("Proxy host is 'gateway', resolving to {}", gateway);
         gateway.clone()
     } else {
         jail.proxy.host.clone()
@@ -78,23 +81,27 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
     // forking an intermediate shell.
     //
     // NOTE: tun2socks (Go) requires double-dash for long options.
-    let tun2socks = tun2socks_bin();
+    let tun2socks = tun2socks_bin()?;
 
     // Prepare a log file for tun2socks stderr output
     let log_dir = jail.runtime_dir();
-    fs::create_dir_all(&log_dir)
-        .with_context(|| format!("Failed to create log directory: {:?}", log_dir))?;
+    security::private_directory(&log_dir)?;
     let tun2socks_log = log_dir.join("tun2socks.log");
-    let log_file = fs::File::create(&tun2socks_log)
-        .with_context(|| format!("Failed to create tun2socks log file: {:?}", tun2socks_log))?;
+    let log_file = security::private_file(&tun2socks_log, false)?;
+    log_file.set_len(0)?;
 
-    let mut cmd = Command::new("ip");
+    let mut cmd = security::command("ip")?;
     cmd.args([
-        "netns", "exec", &netns_name,
-        tun2socks,
-        "--device", "tun://tun0",
-        "--proxy", &proxy_url,
-        "--loglevel", "info",
+        "netns",
+        "exec",
+        &netns_name,
+        tun2socks.to_str().context("Non-UTF8 tun2socks path")?,
+        "--device",
+        "tun://tun0",
+        "--proxy",
+        &proxy_url,
+        "--loglevel",
+        "info",
     ]);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
@@ -110,14 +117,12 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         });
     }
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to start tun2socks at '{}'. Is it installed?",
-                tun2socks,
-            )
-        })?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to start tun2socks at '{}'. Is it installed?",
+            tun2socks.display(),
+        )
+    })?;
 
     let pid = child.id();
 
@@ -126,15 +131,17 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
     let setup = (|| -> Result<()> {
         wait_for_device(&netns_name, "tun0", 5000)?;
         if child.try_wait()?.is_some() {
-            let stderr = fs::read_to_string(&tun2socks_log)
+            let stderr = security::read_to_string(&tun2socks_log)
                 .unwrap_or_else(|_| "<log file unreadable>".to_string());
             anyhow::bail!(
                 "tun2socks died during setup (PID {}). Check log at {}:\n{}",
-                pid, tun2socks_log.display(), stderr,
+                pid,
+                tun2socks_log.display(),
+                stderr,
             );
         }
         crate::network::setup_tun2socks_routing(jail, &transport_proxy_host, &gateway)?;
-        fs::write(&pid_file, pid.to_string())
+        security::write(&pid_file, pid.to_string())
             .with_context(|| format!("Failed to write PID file: {:?}", pid_file))?;
         Ok(())
     })();
@@ -156,10 +163,12 @@ pub fn check_tun2socks_running(jail: &JailConfig) -> Result<Option<u32>> {
         return Ok(None);
     }
 
-    let pid_str = fs::read_to_string(&pid_file)
+    let pid_str = security::read_to_string(&pid_file)
         .with_context(|| format!("Failed to read PID file: {:?}", pid_file))?;
 
-    let pid: u32 = pid_str.trim().parse()
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
         .with_context(|| format!("Invalid PID in file: {}", pid_str))?;
 
     if is_process_running(pid)? {
@@ -213,7 +222,7 @@ fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()
 
     loop {
         // proxy-jail is already root; invoking sudo again is unnecessary.
-        let output = Command::new("ip")
+        let output = security::command("ip")?
             .args(["netns", "exec", netns_name, "ip", "link", "show", device])
             .output();
 
@@ -228,7 +237,9 @@ fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()
         if start.elapsed() > timeout {
             anyhow::bail!(
                 "Timeout waiting for device {} to appear in namespace {} ({}ms)",
-                device, netns_name, timeout_ms
+                device,
+                netns_name,
+                timeout_ms
             );
         }
 
@@ -248,7 +259,10 @@ fn is_process_running(pid: u32) -> Result<bool> {
 
 fn process_stat_is_live(stat: &str) -> Result<bool> {
     let (_, fields) = stat.rsplit_once(')').context("Invalid process stat")?;
-    let state = fields.split_whitespace().next().context("Missing process state")?;
+    let state = fields
+        .split_whitespace()
+        .next()
+        .context("Missing process state")?;
     Ok(!matches!(state, "Z" | "X" | "x"))
 }
 
@@ -264,5 +278,3 @@ mod tests {
         assert!(process_stat_is_live("bad stat").is_err());
     }
 }
-
-

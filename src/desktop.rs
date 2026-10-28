@@ -1,16 +1,27 @@
-use anyhow::{Context, Result};
-use std::collections::HashMap;
+use anyhow::{Context, Result, ensure};
 use nix::unistd::{Gid, Uid, fchown};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::collections::HashMap;
+use std::fs::{self, File};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 use crate::config::JailConfig;
 use crate::config::real_home;
+use crate::security;
+
+pub fn parse_desktop_name(name: &str) -> std::result::Result<String, String> {
+    if name.is_empty()
+        || name.len() > 255
+        || matches!(name, "." | "..")
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        return Err("Expected a desktop filename, not a path".into());
+    }
+    Ok(name.to_string())
+}
 
 /// System .desktop files directory
 const SYSTEM_DESKTOP_DIR: &str = "/usr/share/applications";
@@ -21,37 +32,37 @@ pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Res
     let owner = desktop_owner()?;
     let dir = ensure_desktop_dir(&home, owner)?;
 
-    // Try matching by original source name: pj-{jail}-{command}.desktop
-    // Derive command from desktop_name: strip path and .desktop suffix
-    let stem = Path::new(desktop_name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| desktop_name.to_string());
+    uninstall_in(&dir, &jail.name, desktop_name)?;
+    crate::desktop_cache::refresh(&dir, &home, owner);
+    Ok(())
+}
 
-    // Try the generated name pattern first: pj-{jail}-{stem}.desktop
-    let generated_name = format!("pj-{}-{}.desktop", jail.name, stem);
-    let generated_path = dir.join(&generated_name);
-    if generated_path.exists() {
-        fs::remove_file(&generated_path)
-            .with_context(|| format!("Failed to remove .desktop file: {:?}", generated_path))?;
-        info!("Removed .desktop file: {:?}", generated_path);
-        eprintln!("Removed desktop entry for jail '{}': {}", jail.name, generated_path.display());
-        crate::desktop_cache::refresh(&dir, &home, owner);
-        return Ok(());
-    }
-
-    // If the user passed the full generated filename directly
-    let direct_path = dir.join(desktop_name);
-    if direct_path.exists() {
-        fs::remove_file(&direct_path)
-            .with_context(|| format!("Failed to remove .desktop file: {:?}", direct_path))?;
-        info!("Removed .desktop file: {:?}", direct_path);
-        eprintln!("Removed desktop entry for jail '{}': {}", jail.name, direct_path.display());
-        crate::desktop_cache::refresh(&dir, &home, owner);
-        return Ok(());
-    }
-
-    anyhow::bail!("Desktop file not found for '{}' in jail '{}'", desktop_name, jail.name);
+fn uninstall_in(dir: &Path, jail_name: &str, desktop_name: &str) -> Result<()> {
+    parse_desktop_name(desktop_name).map_err(anyhow::Error::msg)?;
+    crate::config::parse_jail_name(jail_name).map_err(anyhow::Error::msg)?;
+    let prefix = format!("pj-{jail_name}-");
+    let filename = if desktop_name.starts_with(&prefix) && desktop_name.ends_with(".desktop") {
+        desktop_name.to_string()
+    } else {
+        format!(
+            "{prefix}{}.desktop",
+            desktop_name
+                .strip_suffix(".desktop")
+                .unwrap_or(desktop_name)
+        )
+    };
+    let path = dir.join(filename);
+    let entries = parse_desktop_file(&path)?;
+    ensure!(
+        entries.get("X-Proxy-Jail").map(String::as_str) == Some(jail_name),
+        "Refusing to delete an entry not managed by jail '{jail_name}'"
+    );
+    security::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    eprintln!(
+        "Removed desktop entry for jail '{jail_name}': {}",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Find a .desktop file in system directories
@@ -70,10 +81,7 @@ fn find_desktop_file(name: &str) -> Result<PathBuf> {
     };
 
     // Search in system directories
-    let search_dirs = vec![
-        PathBuf::from(SYSTEM_DESKTOP_DIR),
-        user_desktop_dir()?,
-    ];
+    let search_dirs = vec![PathBuf::from(SYSTEM_DESKTOP_DIR), user_desktop_dir()?];
 
     for dir in search_dirs {
         let path = dir.join(&filename);
@@ -87,7 +95,7 @@ fn find_desktop_file(name: &str) -> Result<PathBuf> {
 
 /// Parse a .desktop file into a HashMap (for quick field lookups)
 fn parse_desktop_file(path: &Path) -> Result<HashMap<String, String>> {
-    let content = fs::read_to_string(path)
+    let content = security::read_to_string(path)
         .with_context(|| format!("Failed to read .desktop file: {:?}", path))?;
 
     let mut entries = HashMap::new();
@@ -108,9 +116,7 @@ fn parse_desktop_file(path: &Path) -> Result<HashMap<String, String>> {
         }
 
         // Parse key=value pairs
-        if in_desktop_entry
-            && let Some((key, value)) = line.split_once('=')
-        {
+        if in_desktop_entry && let Some((key, value)) = line.split_once('=') {
             entries.insert(key.trim().to_string(), value.trim().to_string());
         }
     }
@@ -144,7 +150,10 @@ fn transform_desktop_content(
                     output.pop();
                 }
                 output.push_str(&format!("X-Proxy-Jail={}\n", jail_name));
-                output.push_str(&format!("X-Proxy-Jail-Original={}\n", source_path.display()));
+                output.push_str(&format!(
+                    "X-Proxy-Jail-Original={}\n",
+                    source_path.display()
+                ));
                 // Blank line to separate metadata from the next section
                 output.push('\n');
                 desktop_entry_ended = true;
@@ -195,7 +204,10 @@ fn transform_desktop_content(
     // If [Desktop Entry] was the only/last section, append metadata at the end
     if !desktop_entry_ended && in_desktop_entry {
         output.push_str(&format!("X-Proxy-Jail={}\n", jail_name));
-        output.push_str(&format!("X-Proxy-Jail-Original={}\n", source_path.display()));
+        output.push_str(&format!(
+            "X-Proxy-Jail-Original={}\n",
+            source_path.display()
+        ));
     }
 
     output
@@ -230,25 +242,16 @@ fn ensure_desktop_dir(home: &Path, owner: (Uid, Gid)) -> Result<PathBuf> {
     let mut dir = home.to_path_buf();
     for component in [".local", "share", "applications"] {
         dir.push(component);
-        match fs::create_dir(&dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err).with_context(|| format!("Failed to create directory: {:?}", dir)),
-        }
-        // Do not change an existing symlink's target or another user's directory.
-        let metadata = fs::symlink_metadata(&dir)
-            .with_context(|| format!("Failed to inspect directory: {:?}", dir))?;
-        if metadata.is_dir() && metadata.uid() == 0 && owner.0.as_raw() != 0 {
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(&dir)
-                .with_context(|| format!("Failed to open directory: {:?}", dir))?;
-            let actual = file.metadata()?;
-            if actual.uid() == 0 && owner.0.as_raw() != 0 {
-                set_owner(&file, owner)
-                    .with_context(|| format!("Failed to set directory owner: {:?}", dir))?;
-            }
+        let file = security::directory(&dir, true, 0o755)
+            .with_context(|| format!("Failed to open desktop directory: {dir:?}"))?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.uid() == owner.0.as_raw() || metadata.uid() == 0,
+            "Desktop directory belongs to another user: {}",
+            dir.display()
+        );
+        if metadata.uid() == 0 && owner.0.as_raw() != 0 {
+            set_owner(&file, owner)?;
         }
     }
     Ok(dir)
@@ -261,27 +264,7 @@ fn user_desktop_dir() -> Result<PathBuf> {
 
 /// Replace a generated entry atomically, including previously root-owned entries.
 fn write_desktop_file(path: &Path, content: &str, owner: (Uid, Gid)) -> Result<()> {
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().context("Desktop file has no parent directory")?;
-    let (temp_path, mut file) = loop {
-        let name = format!(".proxy-jail-{}-{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
-        let temp_path = parent.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&temp_path) {
-            Ok(file) => break (temp_path, file),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err).with_context(|| format!("Failed to create temporary desktop file in {:?}", parent)),
-        }
-    };
-    let result = (|| -> Result<()> {
-        file.write_all(content.as_bytes()).context("Failed to write desktop file")?;
-        set_owner(&file, owner).context("Failed to set desktop file owner")?;
-        fs::rename(&temp_path, path).context("Failed to install desktop file")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
+    security::atomic_write_owned(path, content.as_bytes(), owner.0, owner.1)
 }
 
 /// Install a .desktop file for an application in a jail, directly from a .desktop file path
@@ -289,27 +272,36 @@ fn write_desktop_file(path: &Path, content: &str, owner: (Uid, Gid)) -> Result<(
 /// preserving all other fields, sections (including [Desktop Action ...]), and
 /// localized strings from the original file.
 pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Result<()> {
+    crate::config::parse_jail_name(&jail.name).map_err(anyhow::Error::msg)?;
     let source_path = find_desktop_file(desktop_path)?;
-    info!("Installing .desktop file from {:?} in jail {}", source_path, jail.name);
+    info!(
+        "Installing .desktop file from {:?} in jail {}",
+        source_path, jail.name
+    );
 
-    let original_content = fs::read_to_string(&source_path)
+    let original_content = security::read_to_string(&source_path)
         .with_context(|| format!("Failed to read .desktop file: {:?}", source_path))?;
 
     // Parse just for the filename stem derivation
     let desktop_entry = parse_desktop_file(&source_path)?;
-    let original_exec = desktop_entry.get("Exec").cloned()
+    let original_exec = desktop_entry
+        .get("Exec")
+        .cloned()
         .context("No Exec field found in .desktop file")?;
 
-    let exec_cmd = source_path.file_stem()
+    let exec_cmd = source_path
+        .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| {
-            original_exec.split_whitespace()
+            original_exec
+                .split_whitespace()
                 .next()
                 .unwrap_or(&original_exec)
                 .to_string()
         });
 
     let target_name = format!("pj-{}-{}.desktop", jail.name, exec_cmd);
+    parse_desktop_name(&target_name).map_err(anyhow::Error::msg)?;
     let home = real_home();
     let owner = desktop_owner()?;
     let dir = ensure_desktop_dir(&home, owner)?;
@@ -322,7 +314,11 @@ pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Resul
         .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
 
     info!("Installed .desktop file: {:?}", target_path);
-    eprintln!("Installed desktop entry for jail '{}': {}", jail.name, target_path.display());
+    eprintln!(
+        "Installed desktop entry for jail '{}': {}",
+        jail.name,
+        target_path.display()
+    );
     crate::desktop_cache::refresh(&dir, &home, owner);
     Ok(())
 }
@@ -365,10 +361,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_deletion_is_confined_to_managed_entries() {
+        for name in [
+            "My Browser.desktop",
+            "浏览器.desktop",
+            "org.example..App.desktop",
+        ] {
+            assert!(parse_desktop_name(name).is_ok());
+        }
+        for name in [".", "..", "bad\nname.desktop", "bad\0name.desktop"] {
+            assert!(parse_desktop_name(name).is_err());
+        }
+        let base = std::env::var_os("PI_SCRATCH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("desktop-delete-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("pj-work-browser.desktop");
+        let content =
+            "[Desktop Entry]\nX-Proxy-Jail=work\nExec=proxy-jail app exec --jail work -- browser\n";
+        fs::write(&path, content).unwrap();
+        for name in [
+            "../victim",
+            "/etc/passwd",
+            "a/b.desktop",
+            "..",
+            "a\\b.desktop",
+        ] {
+            assert!(uninstall_in(&dir, "work", name).is_err());
+        }
+        assert!(uninstall_in(&dir, "other", "pj-work-browser.desktop").is_err());
+        fs::write(&path, "[Desktop Entry]\nX-Proxy-Jail=other\n").unwrap();
+        assert!(uninstall_in(&dir, "work", "browser.desktop").is_err());
+        fs::remove_file(&path).unwrap();
+        let victim = dir.join("victim");
+        fs::write(&victim, content).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(uninstall_in(&dir, "work", "browser.desktop").is_err());
+        assert!(victim.exists());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, content).unwrap();
+        uninstall_in(&dir, "work", "browser.desktop").unwrap();
+        assert!(!path.exists());
+        fs::write(&path, content).unwrap();
+        uninstall_in(&dir, "work", "pj-work-browser.desktop").unwrap();
+        for stem in ["My Browser", "浏览器"] {
+            let generated = format!("pj-work-{stem}.desktop");
+            let path = dir.join(&generated);
+            write_desktop_file(&path, content, desktop_owner().unwrap()).unwrap();
+            uninstall_in(&dir, "work", &format!("{stem}.desktop")).unwrap();
+            assert!(!path.exists());
+            write_desktop_file(&path, content, desktop_owner().unwrap()).unwrap();
+            uninstall_in(&dir, "work", &generated).unwrap();
+            assert!(!path.exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn desktop_parent_symlinks_are_rejected() {
+        let base = std::env::var_os("PI_SCRATCH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let home = base.join(format!("desktop-parent-{}", std::process::id()));
+        fs::create_dir(&home).unwrap();
+        let actual = home.join("actual");
+        fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, home.join(".local")).unwrap();
+        assert!(ensure_desktop_dir(&home, desktop_owner().unwrap()).is_err());
+        assert!(!actual.join("share").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn test_desktop_ownership_and_replacement() {
         use std::os::unix::fs::symlink;
 
-        let home = std::env::temp_dir().join(format!("proxy-jail-desktop-test-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("proxy-jail-desktop-test-{}", std::process::id()));
         fs::create_dir(&home).unwrap();
         let owner = desktop_owner().unwrap();
         let old_dir = home.join(".local/share/applications");
@@ -467,11 +537,16 @@ Exec=/usr/bin/codex-update-manager install-ready
 
         // Metadata injected
         assert!(result.contains("X-Proxy-Jail=testjail\n"));
-        assert!(result.contains("X-Proxy-Jail-Original=/usr/share/applications/codex-desktop.desktop\n"));
+        assert!(
+            result
+                .contains("X-Proxy-Jail-Original=/usr/share/applications/codex-desktop.desktop\n")
+        );
 
         // [Desktop Action] Exec lines also wrapped
         assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- env BAMF_DESKTOP_FILE_HINT=/usr/share/applications/codex-desktop.desktop CHROME_DESKTOP=codex-desktop.desktop CODEX_MULTI_LAUNCH=1 /usr/bin/codex-desktop --new-instance"));
-        assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- /usr/bin/codex-update-manager check-now"));
+        assert!(result.contains(
+            "Exec=proxy-jail app exec --jail testjail -- /usr/bin/codex-update-manager check-now"
+        ));
         assert!(result.contains("Exec=proxy-jail app exec --jail testjail -- /usr/bin/codex-update-manager install-ready"));
 
         // [Desktop Action] Name lines NOT modified

@@ -14,6 +14,7 @@ mod launcher;
 mod network;
 mod output;
 mod proxy;
+mod security;
 mod subnet;
 
 /// Proxy Jail - Force GUI applications through SOCKS5 proxy using network namespaces
@@ -47,6 +48,12 @@ enum Commands {
         #[command(subcommand)]
         command: DesktopCommands,
     },
+    /// Restore the application environment only after setpriv has dropped root.
+    #[command(name = "__run-app", hide = true)]
+    RunApp {
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
     /// Internal DNS relay, spawned inside a jail by proxy-jail.
     #[command(name = "__dns-relay", hide = true)]
     DnsRelay {
@@ -74,7 +81,8 @@ struct DnsArgs {
 enum JailCommands {
     /// Create a new jail
     Create {
-        /// Jail name
+        /// Jail name (1-8 ASCII letters, digits, underscores or hyphens)
+        #[arg(value_parser = config::parse_jail_name)]
         name: String,
         /// SOCKS5 proxy address (host:port or socks5://[username:password@]host:port)
         #[arg(long)]
@@ -85,6 +93,7 @@ enum JailCommands {
     /// Show or update a jail's DNS; apply in place if its namespace is running
     Dns {
         /// Jail name
+        #[arg(value_parser = config::parse_jail_name)]
         name: String,
         #[command(flatten)]
         dns: DnsArgs,
@@ -100,16 +109,19 @@ enum JailCommands {
     /// Start a jail (create network namespace + start tun2socks)
     Start {
         /// Jail name
+        #[arg(value_parser = config::parse_jail_name)]
         name: String,
     },
     /// Stop a jail
     Stop {
         /// Jail name
+        #[arg(value_parser = config::parse_jail_name)]
         name: String,
     },
     /// Delete a jail
     Delete {
         /// Jail name
+        #[arg(value_parser = config::parse_jail_name)]
         name: String,
     },
 }
@@ -119,7 +131,7 @@ enum AppCommands {
     /// Execute a command in a jail
     Exec {
         /// Jail name
-        #[arg(long)]
+        #[arg(long, value_parser = config::parse_jail_name)]
         jail: String,
         /// Command to run (after `--`)
         #[arg(trailing_var_arg = true, required = true)]
@@ -128,13 +140,13 @@ enum AppCommands {
     /// List running applications across jails
     List {
         /// Filter by jail name
-        #[arg(long)]
+        #[arg(long, value_parser = config::parse_jail_name)]
         jail: Option<String>,
     },
     /// Stop an application in a jail
     Stop {
         /// Jail name
-        #[arg(long)]
+        #[arg(long, value_parser = config::parse_jail_name)]
         jail: String,
         /// APP_ID from `app list`, or a unique prefix (not an application name)
         #[arg(value_name = "APP_ID")]
@@ -147,7 +159,7 @@ enum DesktopCommands {
     /// Create a desktop entry from a .desktop file
     Create {
         /// Jail name
-        #[arg(long)]
+        #[arg(long, value_parser = config::parse_jail_name)]
         jail: String,
         /// Path to .desktop file (or name found in system directories)
         #[arg(long)]
@@ -156,15 +168,16 @@ enum DesktopCommands {
     /// Delete a desktop entry
     Delete {
         /// Jail name
-        #[arg(long)]
+        #[arg(long, value_parser = config::parse_jail_name)]
         jail: String,
         /// .desktop file name (e.g. firefox.desktop or pj-xray-firefox.desktop)
+        #[arg(value_parser = desktop::parse_desktop_name)]
         desktop_file: String,
     },
     /// List installed desktop entries
     List {
         /// Filter by jail name
-        #[arg(long)]
+        #[arg(long, value_parser = config::parse_jail_name)]
         jail: Option<String>,
     },
 }
@@ -173,41 +186,28 @@ fn main() -> Result<()> {
     // Help, version and argument errors do not need root privileges.
     let cli = Cli::parse();
 
-    // If not running as root, re-exec ourselves via `sudo -E`.
-    //
-    // `-E` (preserve environment) lets the child inherit the caller's
-    // full environment, so GUI variables (DISPLAY, XAUTHORITY,
-    // DBUS_SESSION_BUS_ADDRESS, etc.) survive the privilege elevation.
-    //
-    // The `debian/postinst` sudoers file must include
-    //     Defaults env_delete += "LD_PRELOAD LD_LIBRARY_PATH PYTHONPATH ..."
-    // so dangerous variables are stripped before reaching the root
-    // process.  See the postinst script for the canonical list.
+    if let Commands::RunApp { command } = &cli.command {
+        return launcher::exec_app(command);
+    }
+
     if !nix::unistd::Uid::effective().is_root() {
-        let args: Vec<String> = std::env::args().collect();
-        let exe = std::env::current_exe()
-            .context("Failed to get current executable path")?;
-
+        let exe = std::env::current_exe().context("Failed to get current executable path")?;
+        // The original GUI/toolchain environment is opaque JSON, not the
+        // environment in which root or its system commands execute.
+        let environment = serde_json::to_string(&security::capture_environment())?;
+        anyhow::ensure!(
+            environment.len() < 100_000,
+            "Application environment is too large"
+        );
         eprintln!("Elevating privileges via sudo...");
-        // We use `-E` (preserve env) PLUS `--preserve-env=PATH` to
-        // override sudo's hard-coded `secure_path` replacement of
-        // PATH.  Without the explicit preserve, sudo will silently
-        // replace PATH with /usr/local/sbin:/usr/local/bin:... and
-        // the user's toolchain (cargo, go, mise, ...) will be lost.
-        //
-        // Note: sudo's env_reset still hard-clears USER/LOGNAME/HOME/
-        // MAIL/SHELL even with -E.  We rebuild those in
-        // `launcher::spawn_app` from the real user info (which is
-        // available via SUDO_UID/SUDO_USER) before exec'ing the user
-        // command, so this is fine.
-        let status = std::process::Command::new("sudo")
-            .arg("-E")
-            .arg("--preserve-env=PATH")
+        let status = security::command("sudo")?
+            .arg("-n")
+            .arg("--")
             .arg(exe)
-            .args(&args[1..])
+            .args(std::env::args_os().skip(1))
+            .env(security::APP_ENV, environment)
             .status()
-            .context("Failed to execute sudo")?;
-
+            .context("Failed to execute sudo; check the sudo-group proxy-jail rule")?;
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -220,8 +220,10 @@ fn main() -> Result<()> {
             // Bind privileged port 53 first, then drop every root privilege.
             if nix::unistd::Uid::effective().is_root() {
                 nix::unistd::setgroups(&[]).map_err(std::io::Error::other)?;
-                nix::unistd::setgid(nix::unistd::Gid::from_raw(65534)).map_err(std::io::Error::other)?;
-                nix::unistd::setuid(nix::unistd::Uid::from_raw(65534)).map_err(std::io::Error::other)?;
+                nix::unistd::setgid(nix::unistd::Gid::from_raw(65534))
+                    .map_err(std::io::Error::other)?;
+                nix::unistd::setuid(nix::unistd::Uid::from_raw(65534))
+                    .map_err(std::io::Error::other)?;
             }
             // Until the manager records this process, it must not survive its
             // parent. The explicit parent check closes the prctl race.
@@ -229,7 +231,9 @@ fn main() -> Result<()> {
                 return Err(std::io::Error::last_os_error());
             }
             if unsafe { libc::getppid() } as u32 != parent {
-                return Err(std::io::Error::other("DNS manager exited before relay registration"));
+                return Err(std::io::Error::other(
+                    "DNS manager exited before relay registration",
+                ));
             }
             use std::io::{Read, Write};
             let mut output = std::io::stdout().lock();
@@ -237,7 +241,9 @@ fn main() -> Result<()> {
             output.flush()?;
             let mut ack = [0];
             std::io::stdin().read_exact(&mut ack)?;
-            if ack != *b"1" { return Err(std::io::Error::other("Invalid DNS manager acknowledgement")); }
+            if ack != *b"1" {
+                return Err(std::io::Error::other("Invalid DNS manager acknowledgement"));
+            }
             if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -245,6 +251,8 @@ fn main() -> Result<()> {
             output.flush()
         });
     }
+    security::private_directory(std::path::Path::new("/run/proxy-jail"))?;
+    security::private_directory(&config::runtime_base_dir())?;
 
     // Load configuration
     let mut config = config::Config::load()?;
@@ -252,10 +260,25 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Jail { command } => match command {
             JailCommands::Create { name, socks5, dns } => {
-                jail::create_jail(&name, &socks5, dns.servers, dns.search.unwrap_or_default(), &mut config)?;
+                jail::create_jail(
+                    &name,
+                    &socks5,
+                    dns.servers,
+                    dns.search.unwrap_or_default(),
+                    &mut config,
+                )?;
             }
-            JailCommands::Dns { name, dns, reset_dns, clear_dns_search } => {
-                let search = if clear_dns_search { Some(Vec::new()) } else { dns.search };
+            JailCommands::Dns {
+                name,
+                dns,
+                reset_dns,
+                clear_dns_search,
+            } => {
+                let search = if clear_dns_search {
+                    Some(Vec::new())
+                } else {
+                    dns.search
+                };
                 jail::configure_jail_dns(&name, dns.servers, search, reset_dns, &mut config)?;
             }
             JailCommands::List => {
@@ -266,8 +289,13 @@ fn main() -> Result<()> {
             }
             JailCommands::Stop { name } => {
                 if jail::stop_jail(&name, &config)? {
-                    eprintln!("Jail '{}' stopped. Existing application processes were not terminated.", name);
-                    eprintln!("Relaunch applications after starting the jail again to use its new network.");
+                    eprintln!(
+                        "Jail '{}' stopped. Existing application processes were not terminated.",
+                        name
+                    );
+                    eprintln!(
+                        "Relaunch applications after starting the jail again to use its new network."
+                    );
                 } else {
                     eprintln!("Jail '{}' is already stopped.", name);
                 }
@@ -294,13 +322,15 @@ fn main() -> Result<()> {
         },
         Commands::Desktop { command } => match command {
             DesktopCommands::Create { jail, from } => {
-                let jail_config = config.find_jail(&jail)
+                let jail_config = config
+                    .find_jail(&jail)
                     .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
 
                 desktop::desktop_install_from_file(jail_config, &from)?;
             }
             DesktopCommands::Delete { jail, desktop_file } => {
-                let jail_config = config.find_jail(&jail)
+                let jail_config = config
+                    .find_jail(&jail)
                     .ok_or_else(|| anyhow::anyhow!("Jail '{}' not found", jail))?;
 
                 desktop::desktop_uninstall_from_file(jail_config, &desktop_file)?;
@@ -321,7 +351,9 @@ fn main() -> Result<()> {
                 }
             }
         },
-        Commands::DnsRelay { .. } => unreachable!("DNS relay runs before loading configuration"),
+        Commands::DnsRelay { .. } | Commands::RunApp { .. } => {
+            unreachable!("Internal command handled before configuration")
+        }
     }
 
     Ok(())
@@ -336,8 +368,7 @@ fn init_logging(verbosity: u8) {
         _ => Level::TRACE,
     };
 
-    let filter = EnvFilter::from_default_env()
-        .add_directive(level.into());
+    let filter = EnvFilter::from_default_env().add_directive(level.into());
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -356,26 +387,58 @@ mod cli_tests {
     #[test]
     fn create_parses_repeated_and_comma_separated_dns_options() {
         let cli = Cli::try_parse_from([
-            "proxy-jail", "jail", "create", "work", "--socks5", "127.0.0.1:1080",
-            "--dns", "10.251.1.1,10.251.1.2", "--dns-server", "10.251.1.3",
-            "--dns-search", "corp.example,lab.example", "--dns-search", "dev.example",
-        ]).unwrap();
-        let Commands::Jail { command: JailCommands::Create { name, dns, .. } } = cli.command else {
+            "proxy-jail",
+            "jail",
+            "create",
+            "work",
+            "--socks5",
+            "127.0.0.1:1080",
+            "--dns",
+            "10.251.1.1,10.251.1.2",
+            "--dns-server",
+            "10.251.1.3",
+            "--dns-search",
+            "corp.example,lab.example",
+            "--dns-search",
+            "dev.example",
+        ])
+        .unwrap();
+        let Commands::Jail {
+            command: JailCommands::Create { name, dns, .. },
+        } = cli.command
+        else {
             panic!("expected jail create");
         };
         assert_eq!(name, "work");
-        assert_eq!(dns.servers.unwrap(), [
-            Ipv4Addr::new(10, 251, 1, 1), Ipv4Addr::new(10, 251, 1, 2), Ipv4Addr::new(10, 251, 1, 3),
-        ]);
-        assert_eq!(dns.search.unwrap(), ["corp.example", "lab.example", "dev.example"]);
+        assert_eq!(
+            dns.servers.unwrap(),
+            [
+                Ipv4Addr::new(10, 251, 1, 1),
+                Ipv4Addr::new(10, 251, 1, 2),
+                Ipv4Addr::new(10, 251, 1, 3),
+            ]
+        );
+        assert_eq!(
+            dns.search.unwrap(),
+            ["corp.example", "lab.example", "dev.example"]
+        );
     }
 
     #[test]
     fn existing_create_syntax_keeps_default_dns() {
         let cli = Cli::try_parse_from([
-            "proxy-jail", "jail", "create", "work", "--socks5", "127.0.0.1:1080",
-        ]).unwrap();
-        let Commands::Jail { command: JailCommands::Create { dns, .. } } = cli.command else {
+            "proxy-jail",
+            "jail",
+            "create",
+            "work",
+            "--socks5",
+            "127.0.0.1:1080",
+        ])
+        .unwrap();
+        let Commands::Jail {
+            command: JailCommands::Create { dns, .. },
+        } = cli.command
+        else {
             panic!("expected jail create");
         };
         assert!(dns.servers.is_none());
@@ -384,13 +447,24 @@ mod cli_tests {
 
     #[test]
     fn dns_inspection_and_partial_updates_do_not_imply_other_changes() {
-        for extra in [vec![], vec!["--dns", "10.251.1.1"], vec!["--dns-search", "corp.example"]] {
+        for extra in [
+            vec![],
+            vec!["--dns", "10.251.1.1"],
+            vec!["--dns-search", "corp.example"],
+        ] {
             let mut args = vec!["proxy-jail", "jail", "dns", "pp"];
             args.extend(&extra);
             let cli = Cli::try_parse_from(args).unwrap();
-            let Commands::Jail { command: JailCommands::Dns {
-                name, dns, reset_dns, clear_dns_search,
-            } } = cli.command else {
+            let Commands::Jail {
+                command:
+                    JailCommands::Dns {
+                        name,
+                        dns,
+                        reset_dns,
+                        clear_dns_search,
+                    },
+            } = cli.command
+            else {
                 panic!("expected jail dns");
             };
             assert_eq!(name, "pp");
@@ -404,9 +478,23 @@ mod cli_tests {
     #[test]
     fn dns_reset_and_search_clear_can_be_requested_together() {
         let cli = Cli::try_parse_from([
-            "proxy-jail", "jail", "dns", "pp", "--reset-dns", "--clear-dns-search",
-        ]).unwrap();
-        let Commands::Jail { command: JailCommands::Dns { reset_dns, clear_dns_search, .. } } = cli.command else {
+            "proxy-jail",
+            "jail",
+            "dns",
+            "pp",
+            "--reset-dns",
+            "--clear-dns-search",
+        ])
+        .unwrap();
+        let Commands::Jail {
+            command:
+                JailCommands::Dns {
+                    reset_dns,
+                    clear_dns_search,
+                    ..
+                },
+        } = cli.command
+        else {
             panic!("expected jail dns");
         };
         assert!(reset_dns);

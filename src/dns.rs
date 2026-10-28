@@ -150,7 +150,11 @@ fn question_key(data: &[u8]) -> Option<Vec<(Vec<u8>, u16, u16)>> {
             } else {
                 name.push(len);
                 let end = cursor.checked_add(1 + len as usize)?;
-                name.extend(data.get(cursor + 1..end)?.iter().map(u8::to_ascii_lowercase));
+                name.extend(
+                    data.get(cursor + 1..end)?
+                        .iter()
+                        .map(u8::to_ascii_lowercase),
+                );
                 cursor = end;
             }
         }
@@ -162,9 +166,12 @@ fn question_key(data: &[u8]) -> Option<Vec<(Vec<u8>, u16, u16)>> {
 
 fn matches_query(query: &[u8], response: &[u8]) -> bool {
     response.get(..2) == query.get(..2)
-        && u16_at(query, 2).zip(u16_at(response, 2))
+        && u16_at(query, 2)
+            .zip(u16_at(response, 2))
             .is_some_and(|(q, r)| q & 0x7800 == r & 0x7800)
-        && question_key(query).zip(question_key(response)).is_some_and(|(q, r)| q == r)
+        && question_key(query)
+            .zip(question_key(response))
+            .is_some_and(|(q, r)| q == r)
 }
 
 // A whole frame has a deadline, not just each individual read/write. This
@@ -310,9 +317,15 @@ fn answer(relay: &Relay, query: &[u8], parsed: &Query, udp: bool) -> Vec<u8> {
 fn handle_tcp(mut stream: TcpStream, relay: &Relay) {
     let deadline = Instant::now() + MAX_TCP_LIFETIME;
     for _ in 0..MAX_TCP_QUERIES {
-        let timeout = deadline.saturating_duration_since(Instant::now()).min(CLIENT_TIMEOUT);
-        if timeout.is_zero() { break; }
-        let Ok(query) = read_frame(&mut stream, timeout) else { break; };
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(CLIENT_TIMEOUT);
+        if timeout.is_zero() {
+            break;
+        }
+        let Ok(query) = read_frame(&mut stream, timeout) else {
+            break;
+        };
         let Some(parsed) = parse_message(&query, true) else {
             break;
         };

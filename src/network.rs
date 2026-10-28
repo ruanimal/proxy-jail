@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Command;
 use tracing::{debug, info};
 
 use crate::config::JailConfig;
-
+use crate::security;
 
 /// Check if a network namespace exists
 pub fn netns_exists(name: &str) -> bool {
@@ -35,7 +34,12 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
 
     // Create veth pair
     info!("Creating veth pair: {} <-> {}", veth_host, veth_ns);
-    run_command("ip", &["link", "add", &veth_host, "type", "veth", "peer", "name", &veth_ns])?;
+    run_command(
+        "ip",
+        &[
+            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_ns,
+        ],
+    )?;
 
     // Move veth-ns into namespace
     run_command("ip", &["link", "set", &veth_ns, "netns", &netns_name])?;
@@ -50,7 +54,11 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     run_command_in_netns(&netns_name, "ip", &["link", "set", "lo", "up"])?;
 
     // Set default gateway in namespace
-    run_command_in_netns(&netns_name, "ip", &["route", "add", "default", "via", &gateway])?;
+    run_command_in_netns(
+        &netns_name,
+        "ip",
+        &["route", "add", "default", "via", &gateway],
+    )?;
 
     // Enable IP forwarding on host
     enable_ip_forward()?;
@@ -59,21 +67,26 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     info!("Adding NAT rule for subnet: {}", subnet);
     run_command(
         "iptables",
-        &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+        &[
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "-j",
+            "MASQUERADE",
+        ],
     )?;
 
     // Allow forwarding from namespace
     run_command(
         "iptables",
-        &[
-            "-A", "FORWARD", "-i", &veth_host, "-j", "ACCEPT",
-        ],
+        &["-A", "FORWARD", "-i", &veth_host, "-j", "ACCEPT"],
     )?;
     run_command(
         "iptables",
-        &[
-            "-A", "FORWARD", "-o", &veth_host, "-j", "ACCEPT",
-        ],
+        &["-A", "FORWARD", "-o", &veth_host, "-j", "ACCEPT"],
     )?;
 
     info!("Network namespace {} created successfully", netns_name);
@@ -90,7 +103,16 @@ pub fn destroy_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     // Remove NAT rule from host
     let _ = run_command(
         "iptables",
-        &["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"],
+        &[
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "-j",
+            "MASQUERADE",
+        ],
     );
 
     // Remove forwarding rules
@@ -118,20 +140,12 @@ pub fn destroy_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
 }
 
 /// Set up routing rules inside the namespace for tun2socks
-pub fn setup_tun2socks_routing(
-    jail: &JailConfig,
-    proxy_host: &str,
-    gateway: &str,
-) -> Result<()> {
+pub fn setup_tun2socks_routing(jail: &JailConfig, proxy_host: &str, gateway: &str) -> Result<()> {
     let netns_name = jail.netns_name();
 
     // Bring tun0 up (tun2socks creates it but may not set it to UP state)
     info!("Bringing tun0 up");
-    run_command_in_netns(
-        &netns_name,
-        "ip",
-        &["link", "set", "tun0", "up"],
-    )?;
+    run_command_in_netns(&netns_name, "ip", &["link", "set", "tun0", "up"])?;
 
     // Resolve hostname to IP (ip route requires IP addresses, not hostnames)
     let resolved_host = resolve_to_ip(proxy_host)?;
@@ -141,14 +155,20 @@ pub fn setup_tun2socks_routing(
     // veth interface already covers it and won't be affected by the default
     // route replacement below.
     if resolved_host != gateway {
-        info!("Setting route for proxy host: {} ({}) via {}", proxy_host, resolved_host, gateway);
+        info!(
+            "Setting route for proxy host: {} ({}) via {}",
+            proxy_host, resolved_host, gateway
+        );
         run_command_in_netns(
             &netns_name,
             "ip",
             &["route", "replace", &resolved_host, "via", gateway],
         )?;
     } else {
-        debug!("Proxy host {} is the gateway, skipping explicit route", resolved_host);
+        debug!(
+            "Proxy host {} is the gateway, skipping explicit route",
+            resolved_host
+        );
     }
 
     // Replace default route to go through TUN device
@@ -205,17 +225,19 @@ pub fn sync_jail_dns(jail: &JailConfig) -> Result<bool> {
 }
 
 fn write_jail_dns(path: &Path, content: &str) -> Result<bool> {
-    let parent = path.parent().context("DNS configuration path has no parent")?;
-    std::fs::create_dir_all(parent)
+    let parent = path
+        .parent()
+        .context("DNS configuration path has no parent")?;
+    security::directory(parent, true, 0o755)
         .with_context(|| format!("Failed to create {}", parent.display()))?;
-    if std::fs::read(path).is_ok_and(|existing| existing == content.as_bytes()) {
+    if security::read(path).is_ok_and(|existing| existing == content.as_bytes()) {
         return Ok(false);
     }
 
     // Keep the inode: ip netns exec bind-mounts this file as /etc/resolv.conf
     // for each process. An atomic rename would leave running applications
     // bound to the old DNS configuration instead of updating them.
-    std::fs::write(path, content)
+    security::write_public(path, content)
         .with_context(|| format!("Failed to write jail DNS configuration: {}", path.display()))?;
     Ok(true)
 }
@@ -232,7 +254,7 @@ fn enable_ip_forward() -> Result<()> {
 fn run_command(program: &str, args: &[&str]) -> Result<()> {
     debug!("Running: {} {}", program, args.join(" "));
 
-    let output = Command::new(program)
+    let output = security::command(program)?
         .args(args)
         .output()
         .with_context(|| format!("Failed to execute: {} {}", program, args.join(" ")))?;
@@ -257,10 +279,17 @@ fn run_command_in_netns(netns: &str, program: &str, args: &[&str]) -> Result<()>
 
     debug!("Running in netns {}: {} {}", netns, program, args.join(" "));
 
-    let output = Command::new("ip")
+    let output = security::command("ip")?
         .args(&full_args)
         .output()
-        .with_context(|| format!("Failed to execute in netns {}: {} {}", netns, program, args.join(" ")))?;
+        .with_context(|| {
+            format!(
+                "Failed to execute in netns {}: {} {}",
+                netns,
+                program,
+                args.join(" ")
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -335,7 +364,10 @@ fn increment_ip(ip: &str, amount: u8) -> Result<String> {
         anyhow::bail!("IP address overflow");
     }
 
-    Ok(format!("{}.{}.{}.{}", result[0], result[1], result[2], result[3]))
+    Ok(format!(
+        "{}.{}.{}.{}",
+        result[0], result[1], result[2], result[3]
+    ))
 }
 
 #[cfg(test)]
@@ -362,7 +394,10 @@ mod tests {
             let path = base.join(format!(
                 "proxy-jail-dns-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
@@ -385,10 +420,7 @@ mod tests {
         let path = directory.resolv_conf();
         let content = jail_dns_config(&dns_jail()).unwrap();
         assert!(write_jail_dns(&path, &content).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
-            DEFAULT_DNS_CONFIG
-        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), DEFAULT_DNS_CONFIG);
     }
 
     #[test]
@@ -399,17 +431,20 @@ mod tests {
         std::fs::write(
             &path,
             "nameserver 192.168.10.1\nnameserver 2408:8248:800:e1a0::1\nsearch old.lan\n",
-        ).unwrap();
+        )
+        .unwrap();
 
-        // A hard link observes the same inode, like an existing bind mount.
-        let bound_path = directory.0.join("bound-resolv.conf");
-        std::fs::hard_link(&path, &bound_path).unwrap();
+        // An open descriptor observes the same inode, like a bind mount,
+        // without introducing a hard link that privileged writes must reject.
+        let mut bound_file = std::fs::File::open(&path).unwrap();
         let old_inode = std::fs::metadata(&path).unwrap().ino();
 
         let content = jail_dns_config(&dns_jail()).unwrap();
         assert!(write_jail_dns(&path, &content).unwrap());
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), old_inode);
-        assert_eq!(std::fs::read_to_string(bound_path).unwrap(), content);
+        let mut observed = String::new();
+        std::io::Read::read_to_string(&mut bound_file, &mut observed).unwrap();
+        assert_eq!(observed, content);
     }
 
     #[test]
@@ -432,7 +467,11 @@ mod tests {
         let path = directory.resolv_conf();
         std::fs::create_dir_all(&path).unwrap();
         let error = write_jail_dns(&path, DEFAULT_DNS_CONFIG).unwrap_err();
-        assert!(error.to_string().contains("Failed to write jail DNS configuration"));
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to write jail DNS configuration")
+        );
     }
 
     #[test]
@@ -448,7 +487,10 @@ mod tests {
 
         let yaml = serde_yaml::to_string(&jail).unwrap();
         let reloaded: JailConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(jail_dns_config(&reloaded).unwrap(), jail_dns_config(&jail).unwrap());
+        assert_eq!(
+            jail_dns_config(&reloaded).unwrap(),
+            jail_dns_config(&jail).unwrap()
+        );
     }
 
     #[test]
@@ -458,12 +500,23 @@ mod tests {
         assert!(jail_dns_config(&jail).is_err());
         for server in ["0.0.0.0", "127.0.0.53", "224.0.0.1", "255.255.255.255"] {
             jail.dns_servers = Some(vec![server.parse().unwrap()]);
-            assert!(jail_dns_config(&jail).is_err(), "accepted DNS server {server}");
+            assert!(
+                jail_dns_config(&jail).is_err(),
+                "accepted DNS server {server}"
+            );
         }
         jail.dns_servers = None;
-        for domain in ["", "corp..example", "corp example", "corp\nnameserver 127.0.0.1"] {
+        for domain in [
+            "",
+            "corp..example",
+            "corp example",
+            "corp\nnameserver 127.0.0.1",
+        ] {
             jail.dns_search = vec![domain.to_string()];
-            assert!(jail_dns_config(&jail).is_err(), "accepted search domain {domain:?}");
+            assert!(
+                jail_dns_config(&jail).is_err(),
+                "accepted search domain {domain:?}"
+            );
         }
     }
 
