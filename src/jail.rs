@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, JailConfig};
 use crate::network;
+use crate::output;
 use crate::proxy;
 
 /// Create a new jail
@@ -47,8 +48,13 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
     // Add to config and save
     config.add_jail(jail)?;
 
-    info!("Jail '{}' created successfully", name);
-    info!("To start the jail, run: proxy-jail app exec --jail {} -- <command>", name);
+    let jail = config.find_jail(name)
+        .with_context(|| format!("Created jail '{}' is missing from configuration", name))?;
+    let subnet = jail.get_subnet(&config.jails)?;
+    eprintln!("{}", output::jail_summary(jail, &subnet, "created (not started)", None)?);
+    eprintln!("  Config:    {}", crate::config::config_path().display());
+    eprintln!("Start: proxy-jail jail start {}", name);
+    eprintln!("Run:   proxy-jail app exec --jail {} -- <command>", name);
 
     Ok(())
 }
@@ -60,8 +66,7 @@ pub fn list_jails(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<15} {:<20} {:<15} {:<16}", "NAME", "PROXY", "STATUS", "NETNS IP");
-    println!("{:-<15} {:-<20} {:-<15} {:-<16}", "", "", "", "");
+    println!("{}", output::jail_table_header());
 
     for jail in &config.jails {
         let status = if network::netns_exists(&jail.netns_name()) {
@@ -74,23 +79,17 @@ pub fn list_jails(config: &Config) -> Result<()> {
             "Stopped"
         };
 
-        let proxy_addr = jail.proxy.socks5_addr();
-
-        // Show the veth IP inside the netns only when the netns is up
-        // — otherwise there's nothing to connect to.
-        let ns_ip = if network::netns_exists(&jail.netns_name()) {
-            let subnet = jail.get_subnet(&config.jails)?;
-            network::get_ns_ip(&subnet).unwrap_or_else(|_| "-".into())
-        } else {
-            "-".to_string()
-        };
-
-        println!("{:<15} {:<20} {:<15} {:<16}",
-            jail.name,
-            proxy_addr,
-            status,
-            ns_ip,
-        );
+        let subnet = jail.get_subnet(&config.jails)?;
+        println!("{}", output::jail_table_row(jail, &subnet, status)?);
+        if status == "Partial" {
+            eprintln!(
+                "Jail '{}' has a namespace but tun2socks is not running.\n  \
+                 Restart: proxy-jail jail start {}\n  Log: {}",
+                jail.name,
+                jail.name,
+                jail.runtime_dir().join("tun2socks.log").display(),
+            );
+        }
     }
 
     Ok(())
@@ -107,11 +106,14 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
     let _lock = acquire_lock(jail)?;
 
     if network::netns_exists(&jail.netns_name())
-        && proxy::check_tun2socks_running(jail)?.is_some()
+        && let Some(pid) = proxy::check_tun2socks_running(jail)?
     {
-        info!("Jail '{}' is already running", name);
+        let subnet = jail.get_subnet(&config.jails)?;
+        eprintln!("{}", output::jail_summary(jail, &subnet, "already running", Some(pid))?);
         return Ok(());
     }
+
+    eprintln!("Starting jail '{}'...", name);
 
     if network::netns_exists(&jail.netns_name()) {
         // Netns exists but tun2socks is not running — just restart tun2socks
@@ -122,12 +124,20 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
         initialize_jail(jail, config)?;
     }
 
-    info!("Jail '{}' started", name);
+    let subnet = jail.get_subnet(&config.jails)?;
+    let pid = proxy::check_tun2socks_running(jail)?.with_context(|| {
+        format!(
+            "tun2socks exited while starting jail '{}'; check {}",
+            name,
+            jail.runtime_dir().join("tun2socks.log").display(),
+        )
+    })?;
+    eprintln!("{}", output::jail_summary(jail, &subnet, "started", Some(pid))?);
     Ok(())
 }
 
-/// Stop a jail (kill tun2socks + delete netns)
-pub fn stop_jail(name: &str, config: &Config) -> Result<()> {
+/// Stop the jail network; return whether a namespace or proxy was running.
+pub fn stop_jail(name: &str, config: &Config) -> Result<bool> {
     let jail = config.find_jail(name)
         .with_context(|| format!("Jail '{}' not found", name))?;
 
@@ -135,6 +145,11 @@ pub fn stop_jail(name: &str, config: &Config) -> Result<()> {
 
     // Acquire lock
     let _lock = acquire_lock(jail)?;
+    let was_running = network::netns_exists(&jail.netns_name())
+        || proxy::check_tun2socks_running(jail)?.is_some();
+    if was_running {
+        eprintln!("Stopping jail '{}'...", name);
+    }
 
     // Stop tun2socks
     proxy::stop_tun2socks(jail)?;
@@ -144,6 +159,11 @@ pub fn stop_jail(name: &str, config: &Config) -> Result<()> {
 
     // Destroy network
     network::destroy_jail_network(jail, &subnet)?;
+    anyhow::ensure!(
+        !network::netns_exists(&jail.netns_name()),
+        "Failed to remove network namespace '{}'",
+        jail.netns_name(),
+    );
 
     // Clean up runtime directory
     let runtime_dir = jail.runtime_dir();
@@ -152,21 +172,21 @@ pub fn stop_jail(name: &str, config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to remove runtime directory: {:?}", runtime_dir))?;
     }
 
-    info!("Jail '{}' stopped", name);
-    Ok(())
+    Ok(was_running)
 }
 
 /// Delete a jail (stop + remove config)
 pub fn delete_jail(name: &str, config: &mut Config) -> Result<()> {
     info!("Deleting jail: {}", name);
 
-    // Stop the jail first (ignore errors if already stopped)
-    let _ = stop_jail(name, config);
+    // Keep the configuration if stopping fails, so cleanup can be retried.
+    let was_running = stop_jail(name, config)?;
 
-    // Remove from config
     config.remove_jail(name)?;
-
-    info!("Jail '{}' deleted", name);
+    eprintln!("Jail '{}' deleted. Configuration entry removed.", name);
+    if was_running {
+        eprintln!("Existing application processes were not terminated.");
+    }
     Ok(())
 }
 
@@ -191,13 +211,13 @@ pub fn run_app(
 
         // Lazy initialization: create network if it doesn't exist
         if !network::netns_exists(&jail.netns_name()) {
-            info!("Jail not initialized, creating network...");
+            eprintln!("Initializing jail '{}'...", jail_name);
             initialize_jail(jail, config)?;
         }
 
         // Ensure tun2socks is running
         if proxy::check_tun2socks_running(jail)?.is_none() {
-            info!("tun2socks not running, starting...");
+            eprintln!("Restarting tun2socks for jail '{}'...", jail_name);
             let subnet = jail.get_subnet(&config.jails)?;
             proxy::start_tun2socks(jail, &subnet)?;
         }
@@ -243,10 +263,7 @@ pub fn run_app(
         }
     };
 
-    info!(
-        "App registered: id={} pid={} name={}",
-        record.app_id, record.pid, record.app_name
-    );
+    eprintln!("{}", output::app_registered(jail_name, &record.app_name, &record.app_id, record.pid));
 
     // Block until the user-facing process exits, then forward status.
     let result = crate::launcher::wait_app(&mut handle);
@@ -495,11 +512,9 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
         anyhow::bail!("Jail '{}' not found", name);
     }
 
-    // Column widths tuned to typical Linux process names. Wider names are
-    // truncated by the {:<N} formatter; users can read the full arg list
-    // from the COMMAND column.
+    // Reserve all 16 characters for the stable application identifier.
     const JAIL_W: usize = 15;
-    const ID_W: usize = 10;
+    const ID_W: usize = 16;
     const PID_W: usize = 8;
     const APP_W: usize = 20;
     const CMD_MIN: usize = 20;
@@ -530,7 +545,10 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
     }
 
     if rows.is_empty() {
-        println!("No running applications in proxy-jail.");
+        match jail_filter {
+            Some(name) => println!("No running applications in jail '{}'.", name),
+            None => println!("No running applications in proxy-jail."),
+        }
         return Ok(());
     }
 
@@ -557,7 +575,7 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
         );
     }
 
-    println!(
+    eprintln!(
         "\nTip: copy the APP_ID column to `app stop --jail {} <APP_ID>`",
         jail_filter.unwrap_or("JAIL")
     );
@@ -567,12 +585,8 @@ pub fn list_apps(jail_filter: Option<&str>, config: &Config) -> Result<()> {
 
 /// Stop an application in a jail.
 ///
-/// `query` is resolved through [`resolve_app_target`]: an exact or
-/// prefixed `app_id` is preferred, with `app_name` (argv[0] basename)
-/// as a fallback.  When the name lookup is ambiguous the function
-/// errors out and lists the matching `app_id`s — this is the fix for
-/// the previous "two `python`s in the same jail kill each other"
-/// behavior.
+/// `query` must be an exact or uniquely prefixed `app_id`. Application names
+/// are not accepted, so multiple instances of one program remain independent.
 ///
 /// We **do not** use `pgrep -f` because it matches its own command line
 /// (and the `sudo`/`ip` wrapper chain), which can cause the `stop`
@@ -585,7 +599,7 @@ pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
 
     // Skip if the jail has not been initialized yet (no netns).
     if !network::netns_exists(&jail.netns_name()) {
-        warn!("Jail '{}' is not running", jail_name);
+        eprintln!("Jail '{}' is not running; no application was signalled.", jail_name);
         return Ok(());
     }
 
@@ -602,17 +616,15 @@ pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
     pids.dedup();
 
     if pids.is_empty() {
-        warn!("No processes found for '{}' in jail '{}'", query, jail_name);
+        eprintln!("No processes found for '{}' in jail '{}'.", query, jail_name);
         return Ok(());
     }
 
+    let mut signalled = 0;
     for pid in &pids {
         debug!("Sending SIGTERM to PID: {}", pid);
-        // SAFETY: pid came from the apps dir; it is valid at the time
-        // of read but may have exited by the time we kill.  kill() on a
-        // nonexistent pid returns ESRCH, which is harmless.
-        unsafe {
-            libc::kill(*pid, libc::SIGTERM);
+        if terminate_app_process(*pid)? {
+            signalled += 1;
         }
     }
 
@@ -624,12 +636,27 @@ pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
         let _ = delete_app_record(jail, &r.app_id);
     }
 
-    info!(
-        "Application '{}' stopped ({} process(es))",
-        query,
-        pids.len()
-    );
+    if signalled > 0 {
+        let ids = targets.iter().map(|record| record.app_id.as_str()).collect::<Vec<_>>().join(", ");
+        eprintln!(
+            "Sent SIGTERM to {} process(es) for APP_ID={} in jail '{}'.",
+            signalled, ids, jail_name,
+        );
+    } else {
+        eprintln!("Application '{}' in jail '{}' has already exited.", query, jail_name);
+    }
     Ok(())
+}
+
+fn terminate_app_process(pid: i32) -> Result<bool> {
+    match nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    ) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Failed to send SIGTERM to PID {}", pid)),
+    }
 }
 
 /// Initialize a jail (create network + start tun2socks)
@@ -939,5 +966,23 @@ mod tests {
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(seen.insert(id), "duplicate app id");
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    #[test]
+    fn sending_sigterm_reports_success_for_an_owned_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(terminate_app_process(child.id() as i32).unwrap());
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn sending_sigterm_to_a_missing_process_is_a_no_op() {
+        assert!(!terminate_app_process(i32::MAX).unwrap());
     }
 }

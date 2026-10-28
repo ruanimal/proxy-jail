@@ -8,6 +8,7 @@ mod desktop;
 mod jail;
 mod launcher;
 mod network;
+mod output;
 mod proxy;
 mod subnet;
 
@@ -17,8 +18,8 @@ mod subnet;
 #[command(version)]
 #[command(about = "Force GUI applications through SOCKS5 proxy using network namespaces")]
 struct Cli {
-    /// Verbosity level (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    /// Extra diagnostic logs (-v: info, -vv: debug, -vvv: trace)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
     #[command(subcommand)]
@@ -95,7 +96,8 @@ enum AppCommands {
         /// Jail name
         #[arg(long)]
         jail: String,
-        /// Application name
+        /// APP_ID from `app list`, or a unique prefix (not an application name)
+        #[arg(value_name = "APP_ID")]
         app: String,
     },
 }
@@ -128,6 +130,9 @@ enum DesktopCommands {
 }
 
 fn main() -> Result<()> {
+    // Help, version and argument errors do not need root privileges.
+    let cli = Cli::parse();
+
     // If not running as root, re-exec ourselves via `sudo -E`.
     //
     // `-E` (preserve environment) lets the child inherit the caller's
@@ -166,8 +171,6 @@ fn main() -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let cli = Cli::parse();
-
     // Initialize logging
     init_logging(cli.verbose);
 
@@ -186,7 +189,12 @@ fn main() -> Result<()> {
                 jail::start_jail(&name, &config)?;
             }
             JailCommands::Stop { name } => {
-                jail::stop_jail(&name, &config)?;
+                if jail::stop_jail(&name, &config)? {
+                    eprintln!("Jail '{}' stopped. Existing application processes were not terminated.", name);
+                    eprintln!("Relaunch applications after starting the jail again to use its new network.");
+                } else {
+                    eprintln!("Jail '{}' is already stopped.", name);
+                }
             }
             JailCommands::Delete { name } => {
                 jail::delete_jail(&name, &mut config)?;
@@ -225,11 +233,14 @@ fn main() -> Result<()> {
                 let files = desktop::list_desktop_files(jail.as_deref())?;
 
                 if files.is_empty() {
-                    println!("No proxy-jail desktop entries found.");
+                    match jail.as_deref() {
+                        Some(name) => println!("No desktop entries found for jail '{}'.", name),
+                        None => println!("No proxy-jail desktop entries found."),
+                    }
                 } else {
                     println!("Installed proxy-jail desktop entries:");
                     for file in files {
-                        println!("  {:?}", file);
+                        println!("  {}", file.display());
                     }
                 }
             }
@@ -253,6 +264,7 @@ fn init_logging(verbosity: u8) {
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)

@@ -88,6 +88,34 @@ sudo cp tun2socks /usr/local/bin/
 
 ## Usage
 
+### Output and diagnostics
+
+Operation progress, success/no-op messages, and diagnostic logs go to stderr.
+Lists go to stdout; `app exec` preserves the application's own stdout, so it
+can still be redirected or piped without mixing in proxy-jail messages.
+
+- `jail create` confirms the configuration path, allocated network, and next
+  commands. Creation saves the configuration but does not start the jail.
+- `jail start` reports whether it started the jail or found it already running,
+  plus the namespace, proxy endpoint, subnet, gateway, jail IP, tun2socks PID,
+  and log path. Proxy credentials are omitted from these summaries.
+- `jail list` includes `SUBNET` and `GATEWAY`. `NETNS IP` is `-` for a stopped
+  jail; `Partial` means the namespace exists but tun2socks is not running and
+  includes a restart hint. `Running` does not verify upstream connectivity.
+- `app exec` reports the registered application's `APP_ID` and PID on stderr.
+  `app stop` confirms that SIGTERM was sent, rather than claiming the process
+  has already exited. Stopping or deleting a jail does not terminate its apps;
+  relaunch them after recreating the jail network.
+
+Normal feedback does not require `-v`. Add `-v`, `-vv`, or `-vvv` for info,
+debug, or trace logs respectively; these options also work after subcommands:
+
+```bash
+proxy-jail jail list -v
+```
+
+Help, version information, and argument validation work without sudo.
+
 ### Create a jail
 
 ```bash
@@ -213,8 +241,8 @@ listens on a veth IP *inside* the netns (e.g. `10.203.240.2`). That IP is
 reachable from the host — find it in `jail list`:
 
 ```text
-NAME             PROXY                STATUS          NETNS IP
-work             socks5://...:1080    Running         10.203.240.2
+NAME            PROXY                  STATUS     SUBNET               GATEWAY         NETNS IP
+work            10.203.240.1:1080      Running    10.203.240.0/30      10.203.240.1    10.203.240.2
 ```
 
 proxy-jail does **not** auto-forward ports.  You forward them yourself

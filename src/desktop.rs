@@ -33,7 +33,7 @@ pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Res
         fs::remove_file(&generated_path)
             .with_context(|| format!("Failed to remove .desktop file: {:?}", generated_path))?;
         info!("Removed .desktop file: {:?}", generated_path);
-        println!("Removed: {:?}", generated_path);
+        eprintln!("Removed desktop entry for jail '{}': {}", jail.name, generated_path.display());
         return Ok(());
     }
 
@@ -43,7 +43,7 @@ pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Res
         fs::remove_file(&direct_path)
             .with_context(|| format!("Failed to remove .desktop file: {:?}", direct_path))?;
         info!("Removed .desktop file: {:?}", direct_path);
-        println!("Removed: {:?}", direct_path);
+        eprintln!("Removed desktop entry for jail '{}': {}", jail.name, direct_path.display());
         return Ok(());
     }
 
@@ -315,7 +315,7 @@ pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Resul
         .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
 
     info!("Installed .desktop file: {:?}", target_path);
-    println!("Installed: {:?}", target_path);
+    eprintln!("Installed desktop entry for jail '{}': {}", jail.name, target_path.display());
     Ok(())
 }
 
@@ -348,6 +348,7 @@ pub fn list_desktop_files(jail_name: Option<&str>) -> Result<Vec<PathBuf>> {
         }
     }
 
+    files.sort();
     Ok(files)
 }
 
