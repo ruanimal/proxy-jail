@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::fs;
+use nix::unistd::{Gid, Uid, fchown};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 use crate::config::JailConfig;
@@ -9,9 +14,6 @@ use crate::config::real_home;
 
 /// System .desktop files directory
 const SYSTEM_DESKTOP_DIR: &str = "/usr/share/applications";
-
-/// User .desktop files directory
-const USER_DESKTOP_DIR: &str = ".local/share/applications";
 
 /// Uninstall a .desktop file by its original name or the generated name
 pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Result<()> {
@@ -195,17 +197,87 @@ fn transform_desktop_content(
     output
 }
 
-/// Get the user's .desktop directory
-fn user_desktop_dir() -> Result<PathBuf> {
-    let dir = real_home().join(USER_DESKTOP_DIR);
-
-    // Create directory if it doesn't exist
-    if !dir.exists() {
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create .desktop directory: {:?}", dir))?;
+/// Resolve the invoking user and group when running under sudo.
+fn desktop_owner() -> Result<(Uid, Gid)> {
+    match std::env::var("SUDO_UID") {
+        Ok(uid) => {
+            let uid = uid.parse::<u32>().context("Invalid SUDO_UID")?;
+            let gid = std::env::var("SUDO_GID")
+                .context("SUDO_GID is required when SUDO_UID is set")?
+                .parse::<u32>()
+                .context("Invalid SUDO_GID")?;
+            Ok((Uid::from_raw(uid), Gid::from_raw(gid)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok((Uid::current(), Gid::current())),
+        Err(err) => Err(err.into()),
     }
+}
 
+fn set_owner(file: &File, owner: (Uid, Gid)) -> Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != owner.0.as_raw() || metadata.gid() != owner.1.as_raw() {
+        fchown(file.as_raw_fd(), Some(owner.0), Some(owner.1))?;
+    }
+    Ok(())
+}
+
+/// Create the user directories and repair root-owned directories from older versions.
+fn ensure_desktop_dir(home: &Path, owner: (Uid, Gid)) -> Result<PathBuf> {
+    let mut dir = home.to_path_buf();
+    for component in [".local", "share", "applications"] {
+        dir.push(component);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err).with_context(|| format!("Failed to create directory: {:?}", dir)),
+        }
+        // Do not change an existing symlink's target or another user's directory.
+        let metadata = fs::symlink_metadata(&dir)
+            .with_context(|| format!("Failed to inspect directory: {:?}", dir))?;
+        if metadata.is_dir() && metadata.uid() == 0 && owner.0.as_raw() != 0 {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&dir)
+                .with_context(|| format!("Failed to open directory: {:?}", dir))?;
+            let actual = file.metadata()?;
+            if actual.uid() == 0 && owner.0.as_raw() != 0 {
+                set_owner(&file, owner)
+                    .with_context(|| format!("Failed to set directory owner: {:?}", dir))?;
+            }
+        }
+    }
     Ok(dir)
+}
+
+/// Get the user's .desktop directory.
+fn user_desktop_dir() -> Result<PathBuf> {
+    ensure_desktop_dir(&real_home(), desktop_owner()?)
+}
+
+/// Replace a generated entry atomically, including previously root-owned entries.
+fn write_desktop_file(path: &Path, content: &str, owner: (Uid, Gid)) -> Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().context("Desktop file has no parent directory")?;
+    let (temp_path, mut file) = loop {
+        let name = format!(".proxy-jail-{}-{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
+        let temp_path = parent.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+            Ok(file) => break (temp_path, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err).with_context(|| format!("Failed to create temporary desktop file in {:?}", parent)),
+        }
+    };
+    let result = (|| -> Result<()> {
+        file.write_all(content.as_bytes()).context("Failed to write desktop file")?;
+        set_owner(&file, owner).context("Failed to set desktop file owner")?;
+        fs::rename(&temp_path, path).context("Failed to install desktop file")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Install a .desktop file for an application in a jail, directly from a .desktop file path
@@ -239,7 +311,7 @@ pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Resul
     // Transform the original file content, preserving all fields and sections
     let content = transform_desktop_content(&original_content, &jail.name, &source_path);
 
-    fs::write(&target_path, &content)
+    write_desktop_file(&target_path, &content, desktop_owner()?)
         .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
 
     info!("Installed .desktop file: {:?}", target_path);
@@ -282,6 +354,40 @@ pub fn list_desktop_files(jail_name: Option<&str>) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_desktop_ownership_and_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let home = std::env::temp_dir().join(format!("proxy-jail-desktop-test-{}", std::process::id()));
+        fs::create_dir(&home).unwrap();
+        let owner = desktop_owner().unwrap();
+        let old_dir = home.join(".local/share/applications");
+        fs::create_dir_all(&old_dir).unwrap();
+        let dir = ensure_desktop_dir(&home, owner).unwrap();
+        for path in [home.join(".local"), home.join(".local/share"), dir.clone()] {
+            let metadata = fs::metadata(path).unwrap();
+            assert_eq!(metadata.uid(), owner.0.as_raw());
+            assert_eq!(metadata.gid(), owner.1.as_raw());
+        }
+
+        let path = dir.join("pj-test.desktop");
+        fs::write(&path, "old entry").unwrap();
+        write_desktop_file(&path, "new entry", owner).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), owner.0.as_raw());
+        assert_eq!(metadata.gid(), owner.1.as_raw());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new entry");
+
+        let other = home.join("other");
+        fs::write(&other, "untouched").unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&other, &path).unwrap();
+        write_desktop_file(&path, "replacement", owner).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(&other).unwrap(), "untouched");
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn test_parse_desktop_file() {

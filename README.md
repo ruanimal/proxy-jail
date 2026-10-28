@@ -145,6 +145,10 @@ proxy-jail app stop --jail work 7f3a2b1c
 proxy-jail desktop create --jail work --from firefox
 ```
 
+Desktop entries are owned by the invoking user. To fix an existing entry
+created by an older version as root, run the same `desktop create` command
+again for that entry.
+
 ### Stop a jail
 
 ```bash
