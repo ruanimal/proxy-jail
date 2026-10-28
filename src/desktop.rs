@@ -17,7 +17,9 @@ const SYSTEM_DESKTOP_DIR: &str = "/usr/share/applications";
 
 /// Uninstall a .desktop file by its original name or the generated name
 pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Result<()> {
-    let dir = user_desktop_dir()?;
+    let home = real_home();
+    let owner = desktop_owner()?;
+    let dir = ensure_desktop_dir(&home, owner)?;
 
     // Try matching by original source name: pj-{jail}-{command}.desktop
     // Derive command from desktop_name: strip path and .desktop suffix
@@ -34,6 +36,7 @@ pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Res
             .with_context(|| format!("Failed to remove .desktop file: {:?}", generated_path))?;
         info!("Removed .desktop file: {:?}", generated_path);
         eprintln!("Removed desktop entry for jail '{}': {}", jail.name, generated_path.display());
+        crate::desktop_cache::refresh(&dir, &home, owner);
         return Ok(());
     }
 
@@ -44,6 +47,7 @@ pub fn desktop_uninstall_from_file(jail: &JailConfig, desktop_name: &str) -> Res
             .with_context(|| format!("Failed to remove .desktop file: {:?}", direct_path))?;
         info!("Removed .desktop file: {:?}", direct_path);
         eprintln!("Removed desktop entry for jail '{}': {}", jail.name, direct_path.display());
+        crate::desktop_cache::refresh(&dir, &home, owner);
         return Ok(());
     }
 
@@ -306,16 +310,20 @@ pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Resul
         });
 
     let target_name = format!("pj-{}-{}.desktop", jail.name, exec_cmd);
-    let target_path = user_desktop_dir()?.join(&target_name);
+    let home = real_home();
+    let owner = desktop_owner()?;
+    let dir = ensure_desktop_dir(&home, owner)?;
+    let target_path = dir.join(&target_name);
 
     // Transform the original file content, preserving all fields and sections
     let content = transform_desktop_content(&original_content, &jail.name, &source_path);
 
-    write_desktop_file(&target_path, &content, desktop_owner()?)
+    write_desktop_file(&target_path, &content, owner)
         .with_context(|| format!("Failed to write .desktop file: {:?}", target_path))?;
 
     info!("Installed .desktop file: {:?}", target_path);
     eprintln!("Installed desktop entry for jail '{}': {}", jail.name, target_path.display());
+    crate::desktop_cache::refresh(&dir, &home, owner);
     Ok(())
 }
 

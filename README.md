@@ -33,6 +33,9 @@ Each jail consists of:
 - `iproute2` (provides `ip` command)
 - `iptables`
 - `tun2socks` binary (bundled automatically in `.deb` package)
+- For desktop cache refresh: `update-desktop-database` from `desktop-file-utils`
+  (recommended by the `.deb`), and the matching `kbuildsycoca6`/`kbuildsycoca5`
+  tool when using KDE Plasma.
 
 ## Installation
 
@@ -176,6 +179,21 @@ proxy-jail desktop create --jail work --from firefox
 Desktop entries are owned by the invoking user. To fix an existing entry
 created by an older version as root, run the same `desktop create` command
 again for that entry.
+
+After creating or deleting an entry, proxy-jail refreshes the user applications
+database with `update-desktop-database`. In KDE sessions it also rebuilds the
+application menu cache with `kbuildsycoca6 --noincremental` or the KDE 5
+equivalent, matching `KDE_SESSION_VERSION` when available. Cache tools run as
+the invoking user with that user's HOME, not as sudo's root account.
+
+Missing tools or refresh failures produce a warning; the completed desktop
+file change is kept. Install `desktop-file-utils` if the database tool is
+missing. You can retry the refresh manually from your normal desktop session:
+
+```bash
+update-desktop-database "$HOME/.local/share/applications"
+kbuildsycoca6 --noincremental  # KDE Plasma 6; use kbuildsycoca5 for Plasma 5
+```
 
 ### Stop a jail
 

@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod desktop;
+mod desktop_cache;
 mod jail;
 mod launcher;
 mod network;
