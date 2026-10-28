@@ -5,6 +5,7 @@ use tracing::{debug, info};
 
 use crate::config::JailConfig;
 
+
 /// Check if a network namespace exists
 pub fn netns_exists(name: &str) -> bool {
     let path = format!("/var/run/netns/{}", name);
@@ -22,6 +23,9 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     let host_ip = format!("{}/{}", increment_ip(&network_addr, 1)?, prefix_len);
     let ns_ip = format!("{}/{}", increment_ip(&network_addr, 2)?, prefix_len);
     let gateway = increment_ip(&network_addr, 1)?;
+
+    // Validate and install independent DNS before creating network resources.
+    sync_jail_dns(jail)?;
 
     info!("Creating network namespace: {}", netns_name);
 
@@ -46,16 +50,6 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
 
     // Set default gateway in namespace
     run_command_in_netns(&netns_name, "ip", &["route", "add", "default", "via", &gateway])?;
-
-    // Set up DNS in namespace (isolated namespace can't reach host's 127.0.0.53)
-    // Copy the host's real DNS server into the namespace's resolv.conf
-    let netns_resolv_dir = format!("/etc/netns/{}", netns_name);
-    std::fs::create_dir_all(&netns_resolv_dir)
-        .with_context(|| format!("Failed to create /etc/netns/{}", netns_name))?;
-    let dns_content = get_host_dns()?;
-    std::fs::write(format!("{}/resolv.conf", netns_resolv_dir), &dns_content)
-        .context("Failed to write namespace resolv.conf")?;
-    debug!("Namespace DNS config:\n{}", dns_content);
 
     // Enable IP forwarding on host
     enable_ip_forward()?;
@@ -182,48 +176,50 @@ pub fn get_ns_ip(subnet: &str) -> Result<String> {
     increment_ip(&network_addr, 2)
 }
 
-/// Get the host's real DNS server configuration
-/// Reads from /run/systemd/resolve/resolv.conf (upstream DNS) or falls back to parsing resolvectl
-fn get_host_dns() -> Result<String> {
-    // Try systemd-resolved's upstream resolv.conf first (contains real DNS servers, not 127.0.0.53)
-    let upstream_path = "/run/systemd/resolve/resolv.conf";
-    if let Ok(content) = std::fs::read_to_string(upstream_path) {
-        // Filter out 127.0.0.53 (stub) and keep real nameservers
-        let filtered: String = content.lines()
-            .filter(|line| {
-                if line.starts_with("nameserver") {
-                    let server = line.split_whitespace().nth(1).unwrap_or("");
-                    server != "127.0.0.53"
-                } else {
-                    true
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if filtered.contains("nameserver") {
-            return Ok(filtered + "\n");
-        }
+/// Build a resolver configuration independent of the host's physical network.
+fn jail_dns_config(jail: &JailConfig) -> Result<String> {
+    jail.validate_dns()?;
+    let mut content = String::new();
+    for server in jail.effective_dns_servers() {
+        content.push_str(&format!("nameserver {server}\n"));
+    }
+    if !jail.dns_search.is_empty() {
+        content.push_str(&format!("search {}\n", jail.dns_search.join(" ")));
+    }
+    // glibc's use-vc sends DNS over TCP, avoiding a SOCKS5 UDP requirement.
+    // Applications with their own resolver may ignore this option.
+    content.push_str("options use-vc\n");
+    Ok(content)
+}
+
+/// Refresh DNS without recreating the netns or restarting its processes.
+/// Returns whether the managed resolver configuration changed.
+pub fn sync_jail_dns(jail: &JailConfig) -> Result<bool> {
+    let content = jail_dns_config(jail)?;
+    let path = Path::new("/etc/netns")
+        .join(jail.netns_name())
+        .join("resolv.conf");
+    let changed = write_jail_dns(&path, &content)?;
+    if changed {
+        debug!("Updated jail DNS via TUN/SOCKS5: {}", path.display());
+    }
+    Ok(changed)
+}
+
+fn write_jail_dns(path: &Path, content: &str) -> Result<bool> {
+    let parent = path.parent().context("DNS configuration path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create {}", parent.display()))?;
+    if std::fs::read(path).is_ok_and(|existing| existing == content.as_bytes()) {
+        return Ok(false);
     }
 
-    // Fallback: parse /etc/resolv.conf (skip 127.0.0.53)
-    if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
-        let filtered: String = content.lines()
-            .filter(|line| {
-                if line.starts_with("nameserver") {
-                    let server = line.split_whitespace().nth(1).unwrap_or("");
-                    server != "127.0.0.53"
-                } else {
-                    !line.is_empty()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if filtered.contains("nameserver") {
-            return Ok(filtered + "\n");
-        }
-    }
-
-    anyhow::bail!("Failed to detect host DNS server")
+    // Keep the inode: ip netns exec bind-mounts this file as /etc/resolv.conf
+    // for each process. An atomic rename would leave running applications
+    // bound to the old DNS configuration instead of updating them.
+    std::fs::write(path, content)
+        .with_context(|| format!("Failed to write jail DNS configuration: {}", path.display()))?;
+    Ok(true)
 }
 
 /// Enable IP forwarding on the host
@@ -350,6 +346,131 @@ fn increment_ip(ip: &str, amount: u8) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const DEFAULT_DNS_CONFIG: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions use-vc\n";
+
+    fn dns_jail() -> JailConfig {
+        serde_yaml::from_str("name: test\nproxy: {host: gateway, port: 1080}\n").unwrap()
+    }
+
+    struct DnsTestDir(PathBuf);
+
+    impl DnsTestDir {
+        fn new() -> Self {
+            let base = std::env::var_os("PI_SCRATCH_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let path = base.join(format!(
+                "proxy-jail-dns-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn resolv_conf(&self) -> PathBuf {
+            self.0.join("pj-test/resolv.conf")
+        }
+    }
+
+    impl Drop for DnsTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_jail_dns_uses_independent_ipv4_servers_and_tcp() {
+        let directory = DnsTestDir::new();
+        let path = directory.resolv_conf();
+        let content = jail_dns_config(&dns_jail()).unwrap();
+        assert!(write_jail_dns(&path, &content).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            DEFAULT_DNS_CONFIG
+        );
+    }
+
+    #[test]
+    fn test_jail_dns_refresh_preserves_existing_bindings() {
+        let directory = DnsTestDir::new();
+        let path = directory.resolv_conf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "nameserver 192.168.10.1\nnameserver 2408:8248:800:e1a0::1\nsearch old.lan\n",
+        ).unwrap();
+
+        // A hard link observes the same inode, like an existing bind mount.
+        let bound_path = directory.0.join("bound-resolv.conf");
+        std::fs::hard_link(&path, &bound_path).unwrap();
+        let old_inode = std::fs::metadata(&path).unwrap().ino();
+
+        let content = jail_dns_config(&dns_jail()).unwrap();
+        assert!(write_jail_dns(&path, &content).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), old_inode);
+        assert_eq!(std::fs::read_to_string(bound_path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_jail_dns_refresh_is_a_noop_when_unchanged() {
+        let directory = DnsTestDir::new();
+        let path = directory.resolv_conf();
+        let content = jail_dns_config(&dns_jail()).unwrap();
+        assert!(write_jail_dns(&path, &content).unwrap());
+        let original = std::fs::metadata(&path).unwrap();
+
+        assert!(!write_jail_dns(&path, &content).unwrap());
+        let unchanged = std::fs::metadata(&path).unwrap();
+        assert_eq!(unchanged.ino(), original.ino());
+        assert_eq!(unchanged.modified().unwrap(), original.modified().unwrap());
+    }
+
+    #[test]
+    fn test_jail_dns_refresh_reports_write_failures() {
+        let directory = DnsTestDir::new();
+        let path = directory.resolv_conf();
+        std::fs::create_dir_all(&path).unwrap();
+        let error = write_jail_dns(&path, DEFAULT_DNS_CONFIG).unwrap_err();
+        assert!(error.to_string().contains("Failed to write jail DNS configuration"));
+    }
+
+    #[test]
+    fn test_private_dns_and_search_domains_are_per_jail() {
+        let mut jail = dns_jail();
+        jail.dns_servers = Some(vec![Ipv4Addr::new(10, 88, 0, 53)]);
+        jail.dns_search = vec!["corp.example".to_string(), "lab.corp.example".to_string()];
+        assert_eq!(
+            jail_dns_config(&jail).unwrap(),
+            "nameserver 10.88.0.53\nsearch corp.example lab.corp.example\noptions use-vc\n"
+        );
+        assert_eq!(jail_dns_config(&dns_jail()).unwrap(), DEFAULT_DNS_CONFIG);
+
+        let yaml = serde_yaml::to_string(&jail).unwrap();
+        let reloaded: JailConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(jail_dns_config(&reloaded).unwrap(), jail_dns_config(&jail).unwrap());
+    }
+
+    #[test]
+    fn test_invalid_jail_dns_configuration_is_rejected() {
+        let mut jail = dns_jail();
+        jail.dns_servers = Some(Vec::new());
+        assert!(jail_dns_config(&jail).is_err());
+        for server in ["0.0.0.0", "127.0.0.53", "224.0.0.1", "255.255.255.255"] {
+            jail.dns_servers = Some(vec![server.parse().unwrap()]);
+            assert!(jail_dns_config(&jail).is_err(), "accepted DNS server {server}");
+        }
+        jail.dns_servers = None;
+        for domain in ["", "corp..example", "corp example", "corp\nnameserver 127.0.0.1"] {
+            jail.dns_search = vec![domain.to_string()];
+            assert!(jail_dns_config(&jail).is_err(), "accepted search domain {domain:?}");
+        }
+    }
 
     #[test]
     fn test_parse_subnet() {

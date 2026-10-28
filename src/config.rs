@@ -1,12 +1,42 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use users::os::unix::UserExt;
 
 use crate::subnet::{self, Ipv4Subnet};
+
+const DEFAULT_DNS_SERVERS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(1, 1, 1, 1),
+    Ipv4Addr::new(8, 8, 8, 8),
+];
+
+/// Shared validation for command-line values and YAML configurations.
+pub fn parse_dns_server(value: &str) -> std::result::Result<Ipv4Addr, String> {
+    let server = value.parse::<Ipv4Addr>()
+        .map_err(|_| format!("Invalid IPv4 DNS server: {value}"))?;
+    if server.is_unspecified() || server.is_loopback()
+        || server.is_multicast() || server.is_broadcast()
+    {
+        return Err(format!("DNS server {server} cannot be reached through the jail's TUN/SOCKS5"));
+    }
+    Ok(server)
+}
+
+pub fn parse_dns_search_domain(domain: &str) -> std::result::Result<String, String> {
+    let name = domain.strip_suffix('.').unwrap_or(domain);
+    let valid = !name.is_empty() && domain.len() <= 253 && name.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63
+            && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    });
+    if !valid {
+        return Err(format!("Invalid DNS search domain: {domain:?}"));
+    }
+    Ok(domain.to_string())
+}
 
 /// Resolve the real user's home directory, even when running under sudo.
 /// Under sudo, $HOME=/root but SUDO_UID points to the invoking user.
@@ -58,6 +88,15 @@ pub struct JailConfig {
     /// If not specified, a non-overlapping /30 is auto-assigned and saved.
     #[serde(default)]
     pub subnet: Option<String>,
+
+    /// DNS servers reached through this jail's TUN/SOCKS5 proxy.
+    /// None uses public defaults; private DNS must be reachable at the proxy exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_servers: Option<Vec<Ipv4Addr>>,
+
+    /// Optional search domains for short internal hostnames (not split DNS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_search: Vec<String>,
 }
 
 /// SOCKS5 proxy configuration
@@ -185,13 +224,13 @@ impl Config {
     }
 
     /// Find a mutable jail by name
-    #[allow(dead_code)]
     pub fn find_jail_mut(&mut self, name: &str) -> Option<&mut JailConfig> {
         self.jails.iter_mut().find(|j| j.name == name)
     }
 
     /// Add a new jail
     pub fn add_jail(&mut self, jail: JailConfig) -> Result<()> {
+        jail.validate_dns()?;
         let path = config_path();
         let _lock = lock_config(&path)?;
         *self = Self::load_unlocked(&path)?;
@@ -201,6 +240,44 @@ impl Config {
         self.jails.push(jail);
         self.assign_missing_subnets()?;
         self.save_to(&path)
+    }
+
+    /// Update only DNS fields using the latest configuration under its lock.
+    pub fn update_jail_dns(
+        &mut self,
+        name: &str,
+        servers: Option<Vec<Ipv4Addr>>,
+        search: Option<Vec<String>>,
+        reset_servers: bool,
+    ) -> Result<()> {
+        self.update_jail_dns_at(&config_path(), name, servers, search, reset_servers)
+    }
+
+    fn update_jail_dns_at(
+        &mut self,
+        path: &Path,
+        name: &str,
+        servers: Option<Vec<Ipv4Addr>>,
+        search: Option<Vec<String>>,
+        reset_servers: bool,
+    ) -> Result<()> {
+        ensure!(!reset_servers || servers.is_none(), "Cannot set and reset DNS servers together");
+        let _lock = lock_config(path)?;
+        let mut latest = Self::load_unlocked(path)?;
+        let jail = latest.find_jail_mut(name)
+            .with_context(|| format!("Jail '{name}' not found"))?;
+        if reset_servers {
+            jail.dns_servers = None;
+        } else if let Some(servers) = servers {
+            jail.dns_servers = Some(servers);
+        }
+        if let Some(search) = search {
+            jail.dns_search = search;
+        }
+        jail.validate_dns()?;
+        latest.save_to(path)?;
+        *self = latest;
+        Ok(())
     }
 
     /// Remove a jail by name
@@ -218,6 +295,25 @@ impl Config {
 }
 
 impl JailConfig {
+    pub fn effective_dns_servers(&self) -> &[Ipv4Addr] {
+        self.dns_servers.as_deref().unwrap_or(&DEFAULT_DNS_SERVERS)
+    }
+
+    pub fn validate_dns(&self) -> Result<()> {
+        ensure!(!self.effective_dns_servers().is_empty(), "Jail '{}': dns_servers must not be empty", self.name);
+        for server in self.effective_dns_servers() {
+            parse_dns_server(&server.to_string())
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("Jail '{}': invalid DNS server", self.name))?;
+        }
+        for domain in &self.dns_search {
+            parse_dns_search_domain(domain)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("Jail '{}': invalid DNS search domain", self.name))?;
+        }
+        Ok(())
+    }
+
     /// Get the network namespace name
     pub fn netns_name(&self) -> String {
         format!("pj-{}", self.name)
@@ -322,6 +418,90 @@ pub fn log_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    struct DnsConfigFixture {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl DnsConfigFixture {
+        fn new() -> (Self, Config) {
+            let base = std::env::var_os("PI_SCRATCH_DIR")
+                .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            let directory = base.join(format!("proxy-jail-dns-config-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let path = directory.join("config.yaml");
+            let config = Config { jails: vec![
+                subnet_jail("xray", Some("10.203.240.0/30")),
+                subnet_jail("pp", Some("10.203.240.4/30")),
+            ] };
+            config.save_to(&path).unwrap();
+            (Self { directory, path }, config)
+        }
+    }
+
+    impl Drop for DnsConfigFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn test_dns_update_preserves_latest_unrelated_settings() {
+        let (fixture, mut config) = DnsConfigFixture::new();
+        config.find_jail_mut("pp").unwrap().dns_search = vec!["corp.example".to_string()];
+        config.save_to(&fixture.path).unwrap();
+        let mut concurrent = config.clone();
+        concurrent.find_jail_mut("xray").unwrap().proxy.port = 2080;
+        concurrent.save_to(&fixture.path).unwrap();
+        let ip = Ipv4Addr::new(10, 251, 1, 1);
+
+        config.update_jail_dns_at(&fixture.path, "pp", Some(vec![ip]), None, false).unwrap();
+        let saved = Config::load_from(&fixture.path).unwrap();
+        let pp = saved.find_jail("pp").unwrap();
+        assert_eq!(pp.dns_servers, Some(vec![ip]));
+        assert_eq!(pp.dns_search, ["corp.example"]);
+        assert_eq!(pp.subnet.as_deref(), Some("10.203.240.4/30"));
+        assert_eq!(pp.proxy.port, 1080);
+        assert_eq!(saved.find_jail("xray").unwrap().proxy.port, 2080);
+        assert!(saved.find_jail("xray").unwrap().dns_servers.is_none());
+    }
+
+    #[test]
+    fn test_dns_search_update_preserves_servers_and_reset_preserves_search() {
+        let (fixture, mut config) = DnsConfigFixture::new();
+        let ip = Ipv4Addr::new(10, 251, 1, 1);
+        config.update_jail_dns_at(&fixture.path, "pp", Some(vec![ip]), None, false).unwrap();
+        config.update_jail_dns_at(&fixture.path, "pp", None, Some(vec!["corp.example".to_string()]), false).unwrap();
+        assert_eq!(config.find_jail("pp").unwrap().dns_servers, Some(vec![ip]));
+        config.update_jail_dns_at(&fixture.path, "pp", None, None, true).unwrap();
+        let pp = config.find_jail("pp").unwrap();
+        assert!(pp.dns_servers.is_none());
+        assert_eq!(pp.dns_search, ["corp.example"]);
+        assert_eq!(pp.effective_dns_servers(), DEFAULT_DNS_SERVERS);
+        config.update_jail_dns_at(&fixture.path, "pp", None, Some(Vec::new()), false).unwrap();
+        assert!(config.find_jail("pp").unwrap().dns_search.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_dns_updates_do_not_change_disk_or_memory() {
+        let (fixture, mut config) = DnsConfigFixture::new();
+        let original_file = std::fs::read(&fixture.path).unwrap();
+        let original_memory = serde_yaml::to_string(&config).unwrap();
+        for (servers, search, reset) in [
+            (Some(Vec::new()), None, false),
+            (Some(vec![Ipv4Addr::LOCALHOST]), None, false),
+            (None, Some(vec!["bad domain".to_string()]), false),
+            (Some(vec![Ipv4Addr::new(10, 251, 1, 1)]), None, true),
+        ] {
+            assert!(config.update_jail_dns_at(&fixture.path, "pp", servers, search, reset).is_err());
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), original_file);
+            assert_eq!(serde_yaml::to_string(&config).unwrap(), original_memory);
+        }
+        assert!(config.update_jail_dns_at(&fixture.path, "missing", None, Some(Vec::new()), false).is_err());
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original_file);
+    }
+
     #[test]
     fn test_config_serialization() {
         let config = Config {
@@ -334,6 +514,8 @@ mod tests {
                     auth: None,
                 },
                 subnet: None,
+                dns_servers: None,
+                dns_search: Vec::new(),
             }],
         };
 
@@ -393,6 +575,8 @@ mod tests {
                 auth: None,
             },
             subnet: subnet.map(str::to_string),
+            dns_servers: None,
+            dns_search: Vec::new(),
         }
     }
 
@@ -490,6 +674,8 @@ mod tests {
                 auth: None,
             },
             subnet: None,
+            dns_servers: None,
+            dns_search: Vec::new(),
         };
 
         assert_eq!(jail.netns_name(), "pj-work");

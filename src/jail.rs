@@ -3,6 +3,7 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -13,7 +14,13 @@ use crate::output;
 use crate::proxy;
 
 /// Create a new jail
-pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result<()> {
+pub fn create_jail(
+    name: &str,
+    socks5_addr: &str,
+    dns_servers: Option<Vec<Ipv4Addr>>,
+    dns_search: Vec<String>,
+    config: &mut Config,
+) -> Result<()> {
     info!("Creating jail: {}", name);
 
     // Parse socks5 address
@@ -43,6 +50,8 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
         name: name.to_string(),
         proxy,
         subnet: None,
+        dns_servers,
+        dns_search,
     };
 
     // Add to config and save
@@ -56,6 +65,49 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
     eprintln!("Start: proxy-jail jail start {}", name);
     eprintln!("Run:   proxy-jail app exec --jail {} -- <command>", name);
 
+    Ok(())
+}
+
+fn dns_summary(jail: &JailConfig) -> String {
+    let servers = jail.effective_dns_servers().iter()
+        .map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let search = if jail.dns_search.is_empty() {
+        "(none)".to_string()
+    } else {
+        jail.dns_search.join(", ")
+    };
+    format!("Jail '{}':\n  DNS servers: {}\n  DNS search:  {}\n  DNS path:    tun0 -> SOCKS5\n", jail.name, servers, search)
+}
+
+/// With no changes, display DNS; otherwise save and refresh the existing netns.
+pub fn configure_jail_dns(
+    name: &str,
+    servers: Option<Vec<Ipv4Addr>>,
+    search: Option<Vec<String>>,
+    reset_servers: bool,
+    config: &mut Config,
+) -> Result<()> {
+    let jail = config.find_jail(name)
+        .with_context(|| format!("Jail '{name}' not found"))?;
+    if servers.is_none() && search.is_none() && !reset_servers {
+        jail.validate_dns()?;
+        print!("{}", dns_summary(jail));
+        return Ok(());
+    }
+
+    let _lock = acquire_lock(jail)?;
+    config.update_jail_dns(name, servers, search, reset_servers)?;
+    let jail = config.find_jail(name)
+        .with_context(|| format!("Updated jail '{name}' is missing from configuration"))?;
+    if network::netns_exists(&jail.netns_name()) {
+        network::sync_jail_dns(jail).with_context(|| format!(
+            "DNS configuration for '{name}' was saved, but could not be applied; retry `proxy-jail jail dns {name} --dns <IP>` or `proxy-jail jail start {name}`"
+        ))?;
+        eprintln!("DNS for jail '{name}' saved and applied in place; applications were not restarted.");
+    } else {
+        eprintln!("DNS for jail '{name}' saved; it will be applied when the jail starts.");
+    }
+    eprint!("{}", dns_summary(jail));
     Ok(())
 }
 
@@ -105,7 +157,12 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
     // Acquire lock
     let _lock = acquire_lock(jail)?;
 
-    if network::netns_exists(&jail.netns_name())
+    let netns_exists = network::netns_exists(&jail.netns_name());
+    if netns_exists && network::sync_jail_dns(jail)? {
+        eprintln!("Updated DNS for jail '{}' (via its TUN/SOCKS5 proxy).", name);
+    }
+
+    if netns_exists
         && let Some(pid) = proxy::check_tun2socks_running(jail)?
     {
         let subnet = jail.get_subnet(&config.jails)?;
@@ -115,7 +172,7 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
 
     eprintln!("Starting jail '{}'...", name);
 
-    if network::netns_exists(&jail.netns_name()) {
+    if netns_exists {
         // Netns exists but tun2socks is not running — just restart tun2socks
         let subnet = jail.get_subnet(&config.jails)?;
         proxy::start_tun2socks(jail, &subnet)?;
@@ -213,6 +270,9 @@ pub fn run_app(
         if !network::netns_exists(&jail.netns_name()) {
             eprintln!("Initializing jail '{}'...", jail_name);
             initialize_jail(jail, config)?;
+        } else {
+            // Also refresh the file bound into already-running applications.
+            network::sync_jail_dns(jail)?;
         }
 
         // Ensure tun2socks is running
@@ -814,6 +874,8 @@ mod tests {
                 auth: None,
             },
             subnet: None,
+            dns_servers: None,
+            dns_search: Vec::new(),
         }
     }
 

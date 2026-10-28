@@ -102,9 +102,13 @@ can still be redirected or piped without mixing in proxy-jail messages.
 - `jail start` reports whether it started the jail or found it already running,
   plus the namespace, proxy endpoint, subnet, gateway, jail IP, tun2socks PID,
   and log path. Proxy credentials are omitted from these summaries.
-- `jail list` includes `SUBNET` and `GATEWAY`. `NETNS IP` is `-` for a stopped
-  jail; `Partial` means the namespace exists but tun2socks is not running and
-  includes a restart hint. `Running` does not verify upstream connectivity.
+- `jail list` includes `SUBNET`, `GATEWAY`, `DNS`, and `DNS SEARCH`. DNS
+  columns show configured servers (including public defaults when unset) and
+  search suffixes, comma-separated without truncation; `DNS SEARCH` is `-`
+  when empty. These values are shown even for stopped jails and do not verify
+  runtime DNS health. `NETNS IP` is `-` for a stopped jail; `Partial` means the
+  namespace exists but tun2socks is not running and includes a restart hint.
+  `Running` does not verify upstream connectivity.
 - `app exec` reports the registered application's `APP_ID` and PID on stderr.
   `app stop` confirms that SIGTERM was sent, rather than claiming the process
   has already exited. Stopping or deleting a jail does not terminate its apps;
@@ -243,6 +247,73 @@ jails:
 > resolved to the host's veth IP at runtime. If your proxy listens on a
 > specific LAN address, use that address directly instead.
 
+### DNS through each jail's proxy
+
+By default, jails use `1.1.1.1` and `8.8.8.8`, not a copy of the physical
+network's DNS servers or search domains. Set `dns_servers` per jail to use
+internal DNS reachable from **that jail's SOCKS5 exit**:
+
+```yaml
+jails:
+  - name: work
+    proxy:
+      host: "gateway"
+      port: 1080
+    dns_servers: ["10.88.0.53", "10.88.0.54"]
+    dns_search: ["corp.example"]
+```
+
+The CLI supports the same settings on creation and for existing jails:
+
+```bash
+proxy-jail jail create work --socks5 127.0.0.1:1080 \
+  --dns 10.88.0.53,10.88.0.54 --dns-search corp.example
+proxy-jail jail dns work                           # Show configured DNS
+proxy-jail jail dns work --dns 10.88.0.53           # Replace servers only
+proxy-jail jail dns work --dns-search corp.example # Replace search suffixes only
+proxy-jail jail dns work --reset-dns               # Restore public defaults
+proxy-jail jail dns work --clear-dns-search        # Remove search suffixes
+```
+
+`--dns` (alias `--dns-server`) and `--dns-search` accept repeated options or
+comma-separated values. Omitted settings are preserved on update. Changes
+are saved and applied in place when the jail namespace already exists,
+without restarting applications or tun2socks; stopped jails use them on the
+next start. A failure to apply the saved configuration is reported as an
+error, not success. Viewing DNS without update options does not change it.
+
+The example addresses must be replaced with actual internal DNS servers.
+Queries follow the jail's default route through `tun0` and its own SOCKS5
+proxy; no direct host/VPN DNS exception is added. Choose resolver addresses
+outside the jail's veth subnet and proxy bypass route. The proxy must be able
+to reach these resolvers; its routing rules still decide the onward path.
+
+Explicit `dns_servers` replace the defaults, rather than appending public
+fallbacks. The internal DNS servers should also resolve/forward public names
+if the jail needs them: a list of internal and public servers is failover,
+not split DNS, and NXDOMAIN does not trigger a retry with a public server.
+`dns_search` expands short names such as `git` to `git.corp.example`; it does
+not implement domain-based routing. DNS server addresses must be IPv4; an
+explicitly empty list is rejected.
+
+The managed `resolv.conf` includes `options use-vc`, so resolvers that honor
+this option (including glibc) send DNS over TCP and do not require SOCKS5
+UDP support. Applications that ignore this option and send UDP still need
+UDP support from the SOCKS5 server. Applications using their own DNS/DoH
+settings keep those settings. LAN-only DNS names and search domains are
+not inherited from the host.
+
+For an existing jail, run the **updated binary** without stopping it:
+
+```bash
+proxy-jail jail start work
+```
+
+This refreshes DNS in place, preserving the file inode bound into running
+applications; it does not restart tun2socks or the applications. Applications
+may retain cached DNS settings or results until they reload or expire.
+Launching another app in the jail also refreshes this configuration.
+
 ## How it works
 
 1. **Network namespace creation**: Creates an isolated network stack named `pj-{jail}`
@@ -259,8 +330,8 @@ listens on a veth IP *inside* the netns (e.g. `10.203.240.2`). That IP is
 reachable from the host — find it in `jail list`:
 
 ```text
-NAME            PROXY                  STATUS     SUBNET               GATEWAY         NETNS IP
-work            10.203.240.1:1080      Running    10.203.240.0/30      10.203.240.1    10.203.240.2
+NAME            PROXY                  STATUS     SUBNET               GATEWAY         NETNS IP        DNS                             DNS SEARCH
+work            10.203.240.1:1080      Running    10.203.240.0/30      10.203.240.1    10.203.240.2    1.1.1.1,8.8.8.8                 -
 ```
 
 proxy-jail does **not** auto-forward ports.  You forward them yourself

@@ -48,8 +48,9 @@ pub fn jail_summary(
 
 pub fn jail_table_header() -> String {
     format!(
-        "{:<15} {:<22} {:<10} {:<20} {:<15} NETNS IP\n{:-<15} {:-<22} {:-<10} {:-<20} {:-<15} {:-<15}",
-        "NAME", "PROXY", "STATUS", "SUBNET", "GATEWAY", "", "", "", "", "", "",
+        "{:<15} {:<22} {:<10} {:<20} {:<15} {:<15} {:<31} DNS SEARCH\n{:-<15} {:-<22} {:-<10} {:-<20} {:-<15} {:-<15} {:-<31} {:-<20}",
+        "NAME", "PROXY", "STATUS", "SUBNET", "GATEWAY", "NETNS IP", "DNS",
+        "", "", "", "", "", "", "", "",
     )
 }
 
@@ -60,14 +61,23 @@ pub fn jail_table_row(jail: &JailConfig, subnet: &str, status: &str) -> Result<S
     } else {
         network::get_ns_ip(subnet)?
     };
+    let dns = jail.effective_dns_servers().iter()
+        .map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let dns_search = if jail.dns_search.is_empty() {
+        "-".to_string()
+    } else {
+        jail.dns_search.join(",")
+    };
     Ok(format!(
-        "{:<15} {:<22} {:<10} {:<20} {:<15} {}",
+        "{:<15} {:<22} {:<10} {:<20} {:<15} {:<15} {:<31} {}",
         jail.name,
         proxy_endpoint(jail, &gateway),
         status,
         subnet,
         gateway,
         ns_ip,
+        dns,
+        dns_search,
     ))
 }
 
@@ -96,6 +106,8 @@ mod tests {
                 }),
             },
             subnet: Some("10.203.240.4/30".to_string()),
+            dns_servers: None,
+            dns_search: Vec::new(),
         }
     }
 
@@ -133,13 +145,58 @@ mod tests {
         let header = jail_table_header();
         assert!(header.contains("SUBNET"));
         assert!(header.contains("GATEWAY"));
+        assert!(header.contains("DNS"));
+        assert!(header.contains("DNS SEARCH"));
         let stopped = jail_table_row(&jail, "10.203.240.4/30", "Stopped").unwrap();
         assert!(stopped.contains("10.203.240.4/30"));
         assert!(stopped.contains("10.203.240.5"));
-        assert!(stopped.ends_with(" -"));
+        let columns: Vec<_> = stopped.split_whitespace().collect();
+        assert_eq!(columns.len(), 8);
+        assert_eq!(columns[5], "-");
+        assert_eq!(columns[6], "1.1.1.1,8.8.8.8");
+        assert_eq!(columns[7], "-");
         for state in ["Running", "Partial"] {
             let row = jail_table_row(&jail, "10.203.240.4/30", state).unwrap();
-            assert!(row.ends_with("10.203.240.6"));
+            let columns: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(columns.len(), 8);
+            assert_eq!(columns[5], "10.203.240.6");
+            assert_eq!(columns[6], "1.1.1.1,8.8.8.8");
+            assert_eq!(columns[7], "-");
+            assert!(!row.contains("private-user"));
+            assert!(!row.contains("private-password"));
+        }
+    }
+
+    #[test]
+    fn table_shows_custom_dns_without_public_fallbacks() {
+        let mut jail = jail();
+        jail.name = "pp".to_string();
+        jail.dns_servers = Some(vec!["10.251.1.1".parse().unwrap()]);
+        let row = jail_table_row(&jail, "10.203.240.4/30", "Running").unwrap();
+        let columns: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(columns.len(), 8);
+        assert_eq!(columns[0], "pp");
+        assert_eq!(columns[6], "10.251.1.1");
+        assert_eq!(columns[7], "-");
+        assert!(!row.contains("1.1.1.1"));
+        assert!(!row.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn table_preserves_multiple_dns_servers_and_search_suffixes_without_truncation() {
+        let mut jail = jail();
+        jail.dns_servers = Some(vec![
+            "192.168.100.100".parse().unwrap(),
+            "192.168.100.101".parse().unwrap(),
+            "192.168.100.102".parse().unwrap(),
+        ]);
+        jail.dns_search = vec!["corp.example".to_string(), "long.internal.example".to_string()];
+        for state in ["Running", "Partial", "Stopped"] {
+            let row = jail_table_row(&jail, "10.203.240.4/30", state).unwrap();
+            let columns: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(columns.len(), 8);
+            assert_eq!(columns[6], "192.168.100.100,192.168.100.101,192.168.100.102");
+            assert_eq!(columns[7], "corp.example,long.internal.example");
             assert!(!row.contains("private-user"));
             assert!(!row.contains("private-password"));
         }

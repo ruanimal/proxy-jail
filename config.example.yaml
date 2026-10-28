@@ -20,6 +20,13 @@ jails:
     # Auto-assignment avoids existing jail subnets and non-default host routes.
     # subnet: "10.203.240.0/30"
 
+    # Optional: internal DNS reachable from this jail's SOCKS5 exit.
+    # Omit for public defaults (1.1.1.1, 8.8.8.8). Custom servers replace them.
+    # Queries still go through this jail's TUN/SOCKS5, not host LAN/VPN DNS.
+    # Internal DNS should forward public queries too when needed.
+    # dns_servers: ["10.88.0.53", "10.88.0.54"]
+    # dns_search: ["corp.example"]  # short-name expansion, not split DNS
+
 
 
   - name: gaming

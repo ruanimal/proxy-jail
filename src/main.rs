@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::net::Ipv4Addr;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
@@ -46,6 +47,19 @@ enum Commands {
     },
 }
 
+#[derive(clap::Args)]
+struct DnsArgs {
+    /// DNS servers reachable from the jail's SOCKS5 exit (repeat or comma-separate)
+    #[arg(long = "dns", visible_alias = "dns-server", value_name = "IP",
+        value_delimiter = ',', value_parser = config::parse_dns_server)]
+    servers: Option<Vec<Ipv4Addr>>,
+
+    /// Search suffixes for short hostnames, not split DNS (repeat or comma-separate)
+    #[arg(long = "dns-search", value_name = "DOMAIN", value_delimiter = ',',
+        value_parser = config::parse_dns_search_domain)]
+    search: Option<Vec<String>>,
+}
+
 #[derive(Subcommand)]
 enum JailCommands {
     /// Create a new jail
@@ -55,6 +69,21 @@ enum JailCommands {
         /// SOCKS5 proxy address (host:port or socks5://[username:password@]host:port)
         #[arg(long)]
         socks5: String,
+        #[command(flatten)]
+        dns: DnsArgs,
+    },
+    /// Show or update a jail's DNS; apply in place if its namespace is running
+    Dns {
+        /// Jail name
+        name: String,
+        #[command(flatten)]
+        dns: DnsArgs,
+        /// Restore default DNS servers (1.1.1.1, 8.8.8.8)
+        #[arg(long, conflicts_with = "servers")]
+        reset_dns: bool,
+        /// Remove all DNS search suffixes
+        #[arg(long, conflicts_with = "search")]
+        clear_dns_search: bool,
     },
     /// List all jails
     List,
@@ -180,8 +209,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Jail { command } => match command {
-            JailCommands::Create { name, socks5 } => {
-                jail::create_jail(&name, &socks5, &mut config)?;
+            JailCommands::Create { name, socks5, dns } => {
+                jail::create_jail(&name, &socks5, dns.servers, dns.search.unwrap_or_default(), &mut config)?;
+            }
+            JailCommands::Dns { name, dns, reset_dns, clear_dns_search } => {
+                let search = if clear_dns_search { Some(Vec::new()) } else { dns.search };
+                jail::configure_jail_dns(&name, dns.servers, search, reset_dns, &mut config)?;
             }
             JailCommands::List => {
                 jail::list_jails(&config)?;
@@ -271,4 +304,69 @@ fn init_logging(verbosity: u8) {
         .with_file(false)
         .with_line_number(false)
         .init();
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn create_parses_repeated_and_comma_separated_dns_options() {
+        let cli = Cli::try_parse_from([
+            "proxy-jail", "jail", "create", "work", "--socks5", "127.0.0.1:1080",
+            "--dns", "10.251.1.1,10.251.1.2", "--dns-server", "10.251.1.3",
+            "--dns-search", "corp.example,lab.example", "--dns-search", "dev.example",
+        ]).unwrap();
+        let Commands::Jail { command: JailCommands::Create { name, dns, .. } } = cli.command else {
+            panic!("expected jail create");
+        };
+        assert_eq!(name, "work");
+        assert_eq!(dns.servers.unwrap(), [
+            Ipv4Addr::new(10, 251, 1, 1), Ipv4Addr::new(10, 251, 1, 2), Ipv4Addr::new(10, 251, 1, 3),
+        ]);
+        assert_eq!(dns.search.unwrap(), ["corp.example", "lab.example", "dev.example"]);
+    }
+
+    #[test]
+    fn existing_create_syntax_keeps_default_dns() {
+        let cli = Cli::try_parse_from([
+            "proxy-jail", "jail", "create", "work", "--socks5", "127.0.0.1:1080",
+        ]).unwrap();
+        let Commands::Jail { command: JailCommands::Create { dns, .. } } = cli.command else {
+            panic!("expected jail create");
+        };
+        assert!(dns.servers.is_none());
+        assert!(dns.search.is_none());
+    }
+
+    #[test]
+    fn dns_inspection_and_partial_updates_do_not_imply_other_changes() {
+        for extra in [vec![], vec!["--dns", "10.251.1.1"], vec!["--dns-search", "corp.example"]] {
+            let mut args = vec!["proxy-jail", "jail", "dns", "pp"];
+            args.extend(&extra);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Jail { command: JailCommands::Dns {
+                name, dns, reset_dns, clear_dns_search,
+            } } = cli.command else {
+                panic!("expected jail dns");
+            };
+            assert_eq!(name, "pp");
+            assert_eq!(dns.servers.is_some(), extra.first() == Some(&"--dns"));
+            assert_eq!(dns.search.is_some(), extra.first() == Some(&"--dns-search"));
+            assert!(!reset_dns);
+            assert!(!clear_dns_search);
+        }
+    }
+
+    #[test]
+    fn dns_reset_and_search_clear_can_be_requested_together() {
+        let cli = Cli::try_parse_from([
+            "proxy-jail", "jail", "dns", "pp", "--reset-dns", "--clear-dns-search",
+        ]).unwrap();
+        let Commands::Jail { command: JailCommands::Dns { reset_dns, clear_dns_search, .. } } = cli.command else {
+            panic!("expected jail dns");
+        };
+        assert!(reset_dns);
+        assert!(clear_dns_search);
+    }
 }

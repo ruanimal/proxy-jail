@@ -72,3 +72,44 @@ fn verbosity_is_available_after_subcommands() {
     assert!(help.contains("--verbose"));
     assert!(help.contains("Extra diagnostic logs"));
 }
+
+#[test]
+fn dns_help_documents_configuration_and_live_updates_without_sudo() {
+    for subcommand in ["create", "dns"] {
+        let output = cli(&["jail", subcommand, "--help"]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("--dns <IP>"));
+        assert!(help.contains("--dns-search <DOMAIN>"));
+        if subcommand == "dns" {
+            assert!(help.contains("--reset-dns"));
+            assert!(help.contains("--clear-dns-search"));
+            assert!(help.contains("apply in place"));
+        }
+    }
+}
+
+#[test]
+fn invalid_or_conflicting_dns_arguments_fail_before_sudo() {
+    for extra in [
+        vec!["--dns", "not-an-ip"],
+        vec!["--dns", "::1"],
+        vec!["--dns", "127.0.0.53"],
+        vec!["--dns", ""],
+        vec!["--dns"],
+        vec!["--dns-search", "bad domain"],
+        vec!["--dns-search", "corp\nnameserver 127.0.0.1"],
+        vec!["--dns", "10.251.1.1", "--reset-dns"],
+        vec!["--dns-search", "corp.example", "--clear-dns-search"],
+    ] {
+        let mut args = vec!["jail", "dns", "pp"];
+        args.extend(extra);
+        let output = cli(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("error:"));
+        assert!(!error.contains("Elevating privileges"));
+    }
+}
