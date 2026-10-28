@@ -3,7 +3,7 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use users::os::unix::UserExt;
 
@@ -58,10 +58,22 @@ pub fn config_path() -> PathBuf {
         .join("config.yaml")
 }
 
-/// Get the runtime directory for PID files and tun2socks configs: $XDG_RUNTIME_DIR/proxy-jail
+/// Get the runtime directory used for each jail's process state.
 pub fn runtime_base_dir() -> PathBuf {
     dirs::runtime_dir()
+        .or_else(|| {
+            // sudo without -E may remove XDG_RUNTIME_DIR, but SUDO_UID still
+            // identifies the user's existing systemd runtime directory.
+            let uid = std::env::var("SUDO_UID").ok()?.parse::<u32>().ok()?;
+            runtime_dir_for_uid(Path::new("/run/user"), uid)
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp").join(format!("proxy-jail-{}", users::get_current_uid())))
+}
+
+fn runtime_dir_for_uid(base: &Path, uid: u32) -> Option<PathBuf> {
+    let path = base.join(uid.to_string());
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    (metadata.is_dir() && metadata.uid() == uid).then_some(path)
 }
 
 /// User data directory for logs and desktop files
@@ -444,6 +456,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn sudo_runtime_fallback_requires_real_directory_owned_by_user() {
+        use std::os::unix::fs::symlink;
+        let (fixture, _) = DnsConfigFixture::new();
+        let uid = users::get_current_uid();
+        let own = fixture.directory.join(uid.to_string());
+        std::fs::create_dir(&own).unwrap();
+        assert_eq!(runtime_dir_for_uid(&fixture.directory, uid), Some(own.clone()));
+        let other = uid + 1;
+        let foreign = fixture.directory.join(other.to_string());
+        std::fs::create_dir(&foreign).unwrap();
+        assert_eq!(runtime_dir_for_uid(&fixture.directory, other), None);
+        std::fs::remove_dir(&own).unwrap();
+        symlink(&foreign, &own).unwrap();
+        assert_eq!(runtime_dir_for_uid(&fixture.directory, uid), None);
     }
 
     #[test]

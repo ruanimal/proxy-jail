@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, JailConfig};
+use crate::dns_process;
 use crate::network;
 use crate::output;
 use crate::proxy;
@@ -99,9 +100,9 @@ pub fn configure_jail_dns(
     config.update_jail_dns(name, servers, search, reset_servers)?;
     let jail = config.find_jail(name)
         .with_context(|| format!("Updated jail '{name}' is missing from configuration"))?;
-    if network::netns_exists(&jail.netns_name()) {
-        network::sync_jail_dns(jail).with_context(|| format!(
-            "DNS configuration for '{name}' was saved, but could not be applied; retry `proxy-jail jail dns {name} --dns <IP>` or `proxy-jail jail start {name}`"
+    if network::netns_exists(&jail.netns_name()) && proxy::check_tun2socks_running(jail)?.is_some() {
+        dns_process::ensure_ready(jail).with_context(|| format!(
+            "DNS configuration for '{name}' was saved, but could not be applied; retry `proxy-jail jail start {name}`"
         ))?;
         eprintln!("DNS for jail '{name}' saved and applied in place; applications were not restarted.");
     } else {
@@ -157,15 +158,18 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
     // Acquire lock
     let _lock = acquire_lock(jail)?;
 
+    // Reload under the jail lock so a concurrent DNS update is not reverted.
+    let current = Config::load()?;
+    let jail = current.find_jail(name)
+        .with_context(|| format!("Jail '{name}' not found"))?;
+    let config = &current;
     let netns_exists = network::netns_exists(&jail.netns_name());
-    if netns_exists && network::sync_jail_dns(jail)? {
-        eprintln!("Updated DNS for jail '{}' (via its TUN/SOCKS5 proxy).", name);
-    }
 
     if netns_exists
         && let Some(pid) = proxy::check_tun2socks_running(jail)?
     {
         let subnet = jail.get_subnet(&config.jails)?;
+        dns_process::ensure_ready(jail)?;
         eprintln!("{}", output::jail_summary(jail, &subnet, "already running", Some(pid))?);
         return Ok(());
     }
@@ -173,9 +177,11 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
     eprintln!("Starting jail '{}'...", name);
 
     if netns_exists {
+        dns_process::stop(jail)?;
         // Netns exists but tun2socks is not running — just restart tun2socks
         let subnet = jail.get_subnet(&config.jails)?;
         proxy::start_tun2socks(jail, &subnet)?;
+        dns_process::ensure_ready(jail)?;
     } else {
         // Full initialization: create network + start tun2socks
         initialize_jail(jail, config)?;
@@ -207,6 +213,9 @@ pub fn stop_jail(name: &str, config: &Config) -> Result<bool> {
     if was_running {
         eprintln!("Stopping jail '{}'...", name);
     }
+
+    // Stop the loopback DNS relay before removing its network namespace.
+    dns_process::stop(jail)?;
 
     // Stop tun2socks
     proxy::stop_tun2socks(jail)?;
@@ -266,23 +275,26 @@ pub fn run_app(
     let subnet = {
         let _lock = acquire_lock(jail)?;
 
-        // Lazy initialization: create network if it doesn't exist
+        // Reload after acquiring the jail lock, so DNS changes aren't reverted
+        // by a command which read the config while another update was running.
+        let current = Config::load()?;
+        let jail = current.find_jail(jail_name)
+            .with_context(|| format!("Jail '{}' not found", jail_name))?;
         if !network::netns_exists(&jail.netns_name()) {
             eprintln!("Initializing jail '{}'...", jail_name);
-            initialize_jail(jail, config)?;
-        } else {
-            // Also refresh the file bound into already-running applications.
-            network::sync_jail_dns(jail)?;
+            initialize_jail(jail, &current)?;
         }
 
         // Ensure tun2socks is running
         if proxy::check_tun2socks_running(jail)?.is_none() {
             eprintln!("Restarting tun2socks for jail '{}'...", jail_name);
-            let subnet = jail.get_subnet(&config.jails)?;
+            dns_process::stop(jail)?;
+            let subnet = jail.get_subnet(&current.jails)?;
             proxy::start_tun2socks(jail, &subnet)?;
         }
+        dns_process::ensure_ready(jail)?;
 
-        jail.get_subnet(&config.jails)?
+        jail.get_subnet(&current.jails)?
     }; // lock released here
 
     // Print a hint about how to reach services running inside the
@@ -733,6 +745,7 @@ fn initialize_jail(jail: &JailConfig, config: &Config) -> Result<()> {
 
     // Start tun2socks
     proxy::start_tun2socks(jail, &subnet)?;
+    dns_process::ensure_ready(jail)?;
 
     Ok(())
 }

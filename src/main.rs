@@ -7,6 +7,8 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod desktop;
 mod desktop_cache;
+mod dns;
+mod dns_process;
 mod jail;
 mod launcher;
 mod network;
@@ -44,6 +46,14 @@ enum Commands {
     Desktop {
         #[command(subcommand)]
         command: DesktopCommands,
+    },
+    /// Internal DNS relay, spawned inside a jail by proxy-jail.
+    #[command(name = "__dns-relay", hide = true)]
+    DnsRelay {
+        #[arg(long = "upstream", required = true, value_parser = config::parse_dns_server)]
+        upstream: Vec<Ipv4Addr>,
+        #[arg(long)]
+        parent: u32,
     },
 }
 
@@ -204,6 +214,38 @@ fn main() -> Result<()> {
     // Initialize logging
     init_logging(cli.verbose);
 
+    if let Commands::DnsRelay { upstream, parent } = &cli.command {
+        let parent = *parent;
+        return dns::serve(upstream.clone(), move || {
+            // Bind privileged port 53 first, then drop every root privilege.
+            if nix::unistd::Uid::effective().is_root() {
+                nix::unistd::setgroups(&[]).map_err(std::io::Error::other)?;
+                nix::unistd::setgid(nix::unistd::Gid::from_raw(65534)).map_err(std::io::Error::other)?;
+                nix::unistd::setuid(nix::unistd::Uid::from_raw(65534)).map_err(std::io::Error::other)?;
+            }
+            // Until the manager records this process, it must not survive its
+            // parent. The explicit parent check closes the prctl race.
+            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { libc::getppid() } as u32 != parent {
+                return Err(std::io::Error::other("DNS manager exited before relay registration"));
+            }
+            use std::io::{Read, Write};
+            let mut output = std::io::stdout().lock();
+            writeln!(output, "READY")?;
+            output.flush()?;
+            let mut ack = [0];
+            std::io::stdin().read_exact(&mut ack)?;
+            if ack != *b"1" { return Err(std::io::Error::other("Invalid DNS manager acknowledgement")); }
+            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            writeln!(output, "ARMED")?;
+            output.flush()
+        });
+    }
+
     // Load configuration
     let mut config = config::Config::load()?;
 
@@ -279,6 +321,7 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Commands::DnsRelay { .. } => unreachable!("DNS relay runs before loading configuration"),
     }
 
     Ok(())

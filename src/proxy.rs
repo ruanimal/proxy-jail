@@ -49,11 +49,16 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         jail.proxy.host.clone()
     };
 
+    // Resolve on the host before starting the relay: resolving the proxy via
+    // the relay would otherwise recursively require the proxy itself. Pass the
+    // same IPv4 address to tun2socks and the namespace bypass route.
+    let transport_proxy_host = crate::network::resolve_to_ip(&effective_proxy_host)?;
+
     // Keep credentials out of the startup log.
-    let proxy_url = jail.proxy.socks5_url(&effective_proxy_host)?;
+    let proxy_url = jail.proxy.socks5_url(&transport_proxy_host)?;
     info!(
-        "Starting tun2socks in namespace: {} -> {}:{}",
-        netns_name, effective_proxy_host, jail.proxy.port
+        "Starting tun2socks in namespace: {} -> {}:{} (resolved {})",
+        netns_name, effective_proxy_host, jail.proxy.port, transport_proxy_host
     );
 
     // Spawn tun2socks via `ip netns exec` (we are already root after the
@@ -105,7 +110,7 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         });
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| {
             format!(
@@ -116,29 +121,29 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
 
     let pid = child.id();
 
-    // Wait for tun0 device to appear (tun2socks needs time to create it)
-    wait_for_device(&netns_name, "tun0", 5000)?;
-
-    // Verify tun2socks is still alive after device setup
-    if !is_process_running(pid)? {
-        let stderr = fs::read_to_string(&tun2socks_log)
-            .unwrap_or_else(|_| "<log file unreadable>".to_string());
-        anyhow::bail!(
-            "tun2socks died during setup (PID {}). Check log at {}:\n{}",
-            pid,
-            tun2socks_log.display(),
-            stderr,
-        );
+    // Do not publish a PID until device and routes are ready. If any setup
+    // step fails, terminate the child so the next start can retry cleanly.
+    let setup = (|| -> Result<()> {
+        wait_for_device(&netns_name, "tun0", 5000)?;
+        if child.try_wait()?.is_some() {
+            let stderr = fs::read_to_string(&tun2socks_log)
+                .unwrap_or_else(|_| "<log file unreadable>".to_string());
+            anyhow::bail!(
+                "tun2socks died during setup (PID {}). Check log at {}:\n{}",
+                pid, tun2socks_log.display(), stderr,
+            );
+        }
+        crate::network::setup_tun2socks_routing(jail, &transport_proxy_host, &gateway)?;
+        fs::write(&pid_file, pid.to_string())
+            .with_context(|| format!("Failed to write PID file: {:?}", pid_file))?;
+        Ok(())
+    })();
+    if let Err(error) = setup {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&pid_file);
+        return Err(error);
     }
-
-    // Write PID file
-    fs::write(&pid_file, pid.to_string())
-        .with_context(|| format!("Failed to write PID file: {:?}", pid_file))?;
-
-    // Set up routing rules
-    // Use effective_proxy_host for routing too (localhost → gateway)
-    crate::network::setup_tun2socks_routing(jail, &effective_proxy_host, &gateway)?;
-
     info!("tun2socks started with PID: {}", pid);
     Ok(pid)
 }
@@ -207,9 +212,9 @@ fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()
     let check_interval = std::time::Duration::from_millis(100);
 
     loop {
-        // Check if device exists in namespace (needs sudo for netns access)
-        let output = Command::new("sudo")
-            .args(["ip", "netns", "exec", netns_name, "ip", "link", "show", device])
+        // proxy-jail is already root; invoking sudo again is unnecessary.
+        let output = Command::new("ip")
+            .args(["netns", "exec", netns_name, "ip", "link", "show", device])
             .output();
 
         match output {
@@ -231,10 +236,33 @@ fn wait_for_device(netns_name: &str, device: &str, timeout_ms: u64) -> Result<()
     }
 }
 
-/// Check if a process is running
+/// A zombie still has /proc/PID but no longer owns its network device.
 fn is_process_running(pid: u32) -> Result<bool> {
-    let proc_path = format!("/proc/{}", pid);
-    Ok(Path::new(&proc_path).exists())
+    let path = format!("/proc/{pid}/stat");
+    match fs::read_to_string(&path) {
+        Ok(stat) => process_stat_is_live(&stat),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {path}")),
+    }
+}
+
+fn process_stat_is_live(stat: &str) -> Result<bool> {
+    let (_, fields) = stat.rsplit_once(')').context("Invalid process stat")?;
+    let state = fields.split_whitespace().next().context("Missing process state")?;
+    Ok(!matches!(state, "Z" | "X" | "x"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zombie_or_dead_process_is_not_running() {
+        assert!(process_stat_is_live("42 (tun2socks) S 1").unwrap());
+        assert!(!process_stat_is_live("42 (tun2socks) Z 1").unwrap());
+        assert!(!process_stat_is_live("42 (name with ) parens) X 1").unwrap());
+        assert!(process_stat_is_live("bad stat").is_err());
+    }
 }
 
 

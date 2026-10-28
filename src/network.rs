@@ -24,8 +24,9 @@ pub fn create_jail_network(jail: &JailConfig, subnet: &str) -> Result<()> {
     let ns_ip = format!("{}/{}", increment_ip(&network_addr, 2)?, prefix_len);
     let gateway = increment_ip(&network_addr, 1)?;
 
-    // Validate and install independent DNS before creating network resources.
-    sync_jail_dns(jail)?;
+    // Validate before creating network resources. DNS is published only
+    // after the TUN route and loopback relay are ready.
+    jail.validate_dns()?;
 
     info!("Creating network namespace: {}", netns_name);
 
@@ -135,16 +136,16 @@ pub fn setup_tun2socks_routing(
     // Resolve hostname to IP (ip route requires IP addresses, not hostnames)
     let resolved_host = resolve_to_ip(proxy_host)?;
 
-    // Add route for proxy host to bypass TUN (go through veth)
+    // Replace the proxy bypass route so recovery after a tun2socks restart is idempotent.
     // Skip if proxy host is the gateway itself — the connected route on the
     // veth interface already covers it and won't be affected by the default
     // route replacement below.
     if resolved_host != gateway {
-        info!("Adding route for proxy host: {} ({}) via {}", proxy_host, resolved_host, gateway);
+        info!("Setting route for proxy host: {} ({}) via {}", proxy_host, resolved_host, gateway);
         run_command_in_netns(
             &netns_name,
             "ip",
-            &["route", "add", &resolved_host, "via", gateway],
+            &["route", "replace", &resolved_host, "via", gateway],
         )?;
     } else {
         debug!("Proxy host {} is the gateway, skipping explicit route", resolved_host);
@@ -180,14 +181,11 @@ pub fn get_ns_ip(subnet: &str) -> Result<String> {
 fn jail_dns_config(jail: &JailConfig) -> Result<String> {
     jail.validate_dns()?;
     let mut content = String::new();
-    for server in jail.effective_dns_servers() {
-        content.push_str(&format!("nameserver {server}\n"));
-    }
+    content.push_str("nameserver 127.0.0.1\n");
     if !jail.dns_search.is_empty() {
         content.push_str(&format!("search {}\n", jail.dns_search.join(" ")));
     }
-    // glibc's use-vc sends DNS over TCP, avoiding a SOCKS5 UDP requirement.
-    // Applications with their own resolver may ignore this option.
+    // glibc uses TCP to the local relay. Other clients can use UDP.
     content.push_str("options use-vc\n");
     Ok(content)
 }
@@ -201,7 +199,7 @@ pub fn sync_jail_dns(jail: &JailConfig) -> Result<bool> {
         .join("resolv.conf");
     let changed = write_jail_dns(&path, &content)?;
     if changed {
-        debug!("Updated jail DNS via TUN/SOCKS5: {}", path.display());
+        debug!("Updated jail DNS to use local relay: {}", path.display());
     }
     Ok(changed)
 }
@@ -278,22 +276,19 @@ fn run_command_in_netns(netns: &str, program: &str, args: &[&str]) -> Result<()>
     Ok(())
 }
 
-/// Resolve a hostname to an IP address
-fn resolve_to_ip(host: &str) -> Result<String> {
-    // Already an IP address?
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(host.to_string());
+/// Resolve the SOCKS5 endpoint on the host before the jail DNS relay starts.
+/// The jail's IPv4 bypass route and tun2socks must use the same address.
+pub fn resolve_to_ip(host: &str) -> Result<String> {
+    use std::net::{Ipv4Addr, ToSocketAddrs};
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Ok(ip.to_string());
     }
-
-    // Resolve via DNS
-    use std::net::ToSocketAddrs;
     let addr = format!("{}:0", host);
-    let mut addrs = addr.to_socket_addrs()
-        .with_context(|| format!("Failed to resolve hostname: {}", host))?;
-
-    addrs.next()
-        .map(|a| a.ip().to_string())
-        .ok_or_else(|| anyhow::anyhow!("No addresses found for hostname: {}", host))
+    addr.to_socket_addrs()
+        .with_context(|| format!("Failed to resolve hostname: {}", host))?
+        .find(|address| address.is_ipv4())
+        .map(|address| address.ip().to_string())
+        .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for hostname: {}", host))
 }
 
 /// Parse a subnet string (e.g., "10.10.0.0/24") into network address and prefix length
@@ -351,7 +346,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const DEFAULT_DNS_CONFIG: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions use-vc\n";
+    const DEFAULT_DNS_CONFIG: &str = "nameserver 127.0.0.1\noptions use-vc\n";
 
     fn dns_jail() -> JailConfig {
         serde_yaml::from_str("name: test\nproxy: {host: gateway, port: 1080}\n").unwrap()
@@ -385,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jail_dns_uses_independent_ipv4_servers_and_tcp() {
+    fn test_jail_dns_uses_local_relay_and_tcp() {
         let directory = DnsTestDir::new();
         let path = directory.resolv_conf();
         let content = jail_dns_config(&dns_jail()).unwrap();
@@ -447,7 +442,7 @@ mod tests {
         jail.dns_search = vec!["corp.example".to_string(), "lab.corp.example".to_string()];
         assert_eq!(
             jail_dns_config(&jail).unwrap(),
-            "nameserver 10.88.0.53\nsearch corp.example lab.corp.example\noptions use-vc\n"
+            "nameserver 127.0.0.1\nsearch corp.example lab.corp.example\noptions use-vc\n"
         );
         assert_eq!(jail_dns_config(&dns_jail()).unwrap(), DEFAULT_DNS_CONFIG);
 
@@ -470,6 +465,13 @@ mod tests {
             jail.dns_search = vec![domain.to_string()];
             assert!(jail_dns_config(&jail).is_err(), "accepted search domain {domain:?}");
         }
+    }
+
+    #[test]
+    fn test_resolve_proxy_endpoint_as_ipv4_before_relay_starts() {
+        assert_eq!(resolve_to_ip("10.126.126.2").unwrap(), "10.126.126.2");
+        assert_eq!(resolve_to_ip("localhost").unwrap(), "127.0.0.1");
+        assert!(resolve_to_ip("::1").is_err());
     }
 
     #[test]

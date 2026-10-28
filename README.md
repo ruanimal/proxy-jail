@@ -283,10 +283,14 @@ next start. A failure to apply the saved configuration is reported as an
 error, not success. Viewing DNS without update options does not change it.
 
 The example addresses must be replaced with actual internal DNS servers.
-Queries follow the jail's default route through `tun0` and its own SOCKS5
-proxy; no direct host/VPN DNS exception is added. Choose resolver addresses
-outside the jail's veth subnet and proxy bypass route. The proxy must be able
-to reach these resolvers; its routing rules still decide the onward path.
+Each jail runs an unprivileged DNS relay listening only on its loopback
+`127.0.0.1:53` over UDP and TCP. It forwards each query separately over TCP
+to the configured upstream via `tun0` and that jail's SOCKS5 proxy, including
+upstreams that close TCP connections after a single response. This also lets
+UDP DNS clients work with TCP-only SOCKS5 servers. The actual upstream routes
+must use `tun0`; bypassed addresses are rejected when starting the relay.
+No direct host/VPN DNS exception is added. The proxy must be able to reach
+the configured upstream DNS servers; its rules decide the onward path.
 
 Explicit `dns_servers` replace the defaults, rather than appending public
 fallbacks. The internal DNS servers should also resolve/forward public names
@@ -296,12 +300,12 @@ not split DNS, and NXDOMAIN does not trigger a retry with a public server.
 not implement domain-based routing. DNS server addresses must be IPv4; an
 explicitly empty list is rejected.
 
-The managed `resolv.conf` includes `options use-vc`, so resolvers that honor
-this option (including glibc) send DNS over TCP and do not require SOCKS5
-UDP support. Applications that ignore this option and send UDP still need
-UDP support from the SOCKS5 server. Applications using their own DNS/DoH
-settings keep those settings. LAN-only DNS names and search domains are
-not inherited from the host.
+The managed `resolv.conf` points to the local relay and includes `options
+use-vc` for glibc. Applications that honor the system resolver can use either
+local TCP or UDP. Applications with their own DNS or DoH settings may bypass
+the relay; Chrome may need its own DNS cache cleared or a restart after a DNS
+change. LAN-only DNS names and search domains are not inherited from the host.
+The relay does not provide split DNS or a DNS cache.
 
 For an existing jail, run the **updated binary** without stopping it:
 
@@ -309,10 +313,12 @@ For an existing jail, run the **updated binary** without stopping it:
 proxy-jail jail start work
 ```
 
-This refreshes DNS in place, preserving the file inode bound into running
-applications; it does not restart tun2socks or the applications. Applications
-may retain cached DNS settings or results until they reload or expire.
-Launching another app in the jail also refreshes this configuration.
+This starts the relay and refreshes DNS in place, preserving the file inode
+bound into running applications; it does not restart tun2socks or applications.
+Applications may retain cached DNS settings or results until reloaded or
+restarted. Launching another app in the jail also starts or refreshes the
+relay. Avoid using an older proxy-jail binary afterward: it may overwrite the
+resolver configuration with its legacy direct-upstream settings.
 
 ## How it works
 
