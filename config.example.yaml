@@ -16,8 +16,9 @@ jails:
       #   username: "user"
       #   password: "pass"
 
-    # Optional: specify subnet (auto-assigned if not set)
-    # subnet: "10.10.0.0/24"
+    # Optional: specify subnet (otherwise a /30 from 10.203.240.0/20 is saved)
+    # Auto-assignment avoids existing jail subnets and non-default host routes.
+    # subnet: "10.203.240.0/30"
 
 
 

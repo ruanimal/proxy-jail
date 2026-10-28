@@ -369,5 +369,14 @@ mod tests {
     fn test_get_gateway() {
         assert_eq!(get_gateway("10.10.0.0/24").unwrap(), "10.10.0.1");
         assert_eq!(get_gateway("10.10.1.0/24").unwrap(), "10.10.1.1");
+        assert_eq!(get_gateway("10.203.240.0/30").unwrap(), "10.203.240.1");
+        assert_eq!(get_gateway("10.203.240.4/30").unwrap(), "10.203.240.5");
+    }
+
+    #[test]
+    fn test_get_ns_ip_for_30_subnets() {
+        assert_eq!(get_ns_ip("10.203.240.0/30").unwrap(), "10.203.240.2");
+        assert_eq!(get_ns_ip("10.203.240.4/30").unwrap(), "10.203.240.6");
+        assert_eq!(get_ns_ip("10.203.240.252/30").unwrap(), "10.203.240.254");
     }
 }

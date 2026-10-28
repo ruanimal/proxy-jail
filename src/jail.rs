@@ -79,7 +79,7 @@ pub fn list_jails(config: &Config) -> Result<()> {
         // Show the veth IP inside the netns only when the netns is up
         // — otherwise there's nothing to connect to.
         let ns_ip = if network::netns_exists(&jail.netns_name()) {
-            let subnet = jail.get_subnet(&config.jails);
+            let subnet = jail.get_subnet(&config.jails)?;
             network::get_ns_ip(&subnet).unwrap_or_else(|_| "-".into())
         } else {
             "-".to_string()
@@ -115,7 +115,7 @@ pub fn start_jail(name: &str, config: &Config) -> Result<()> {
 
     if network::netns_exists(&jail.netns_name()) {
         // Netns exists but tun2socks is not running — just restart tun2socks
-        let subnet = jail.get_subnet(&config.jails);
+        let subnet = jail.get_subnet(&config.jails)?;
         proxy::start_tun2socks(jail, &subnet)?;
     } else {
         // Full initialization: create network + start tun2socks
@@ -140,7 +140,7 @@ pub fn stop_jail(name: &str, config: &Config) -> Result<()> {
     proxy::stop_tun2socks(jail)?;
 
     // Get subnet for cleanup
-    let subnet = jail.get_subnet(&config.jails);
+    let subnet = jail.get_subnet(&config.jails)?;
 
     // Destroy network
     network::destroy_jail_network(jail, &subnet)?;
@@ -198,11 +198,11 @@ pub fn run_app(
         // Ensure tun2socks is running
         if proxy::check_tun2socks_running(jail)?.is_none() {
             info!("tun2socks not running, starting...");
-            let subnet = jail.get_subnet(&config.jails);
+            let subnet = jail.get_subnet(&config.jails)?;
             proxy::start_tun2socks(jail, &subnet)?;
         }
 
-        jail.get_subnet(&config.jails)
+        jail.get_subnet(&config.jails)?
     }; // lock released here
 
     // Print a hint about how to reach services running inside the
@@ -634,7 +634,7 @@ pub fn stop_app(jail_name: &str, query: &str, config: &Config) -> Result<()> {
 
 /// Initialize a jail (create network + start tun2socks)
 fn initialize_jail(jail: &JailConfig, config: &Config) -> Result<()> {
-    let subnet = jail.get_subnet(&config.jails);
+    let subnet = jail.get_subnet(&config.jails)?;
 
     // Create runtime directory
     let runtime_dir = jail.runtime_dir();

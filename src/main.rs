@@ -9,6 +9,7 @@ mod jail;
 mod launcher;
 mod network;
 mod proxy;
+mod subnet;
 
 /// Proxy Jail - Force GUI applications through SOCKS5 proxy using network namespaces
 #[derive(Parser)]

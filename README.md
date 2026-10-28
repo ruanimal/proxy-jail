@@ -165,6 +165,21 @@ proxy-jail jail delete work
 
 Configuration is stored at `~/.config/proxy-jail/config.yaml` (respects `$XDG_CONFIG_HOME`). See `config.example.yaml` for the format.
 
+Automatic allocation uses consecutive `/30` subnets from `10.203.240.0/20`
+(for example, `10.203.240.0/30`, then `10.203.240.4/30`). Each has two usable
+addresses: network + 1 for the host gateway and network + 2 for the jail.
+Only the individual `/30` routes are installed, not a route for the whole pool.
+The allocator skips ranges overlapping configured jails or non-default host
+IPv4 routes across all routing tables, and reports an error if the pool is full.
+No private pool is guaranteed conflict-free when networks change later.
+
+Assignments are saved so they stay stable when other jails are added or
+deleted. You can also set `subnet` explicitly; existing explicit subnets,
+including legacy `/24` configurations, are kept unchanged. Missing subnets are
+assigned and saved on first load. To migrate a running jail, stop it while its
+old subnet is still configured, edit `subnet`, then start it again. Applications
+left in the old namespace must be relaunched to use the recreated network.
+
 ### Example configuration
 
 ```yaml
@@ -194,12 +209,12 @@ jails:
 ## Reaching services inside a jail
 
 When you `app exec` a server (e.g. `python -m http.server`), the service
-listens on a veth IP *inside* the netns (e.g. `10.10.0.2`).  That IP is
+listens on a veth IP *inside* the netns (e.g. `10.203.240.2`). That IP is
 reachable from the host — find it in `jail list`:
 
 ```text
 NAME             PROXY                STATUS          NETNS IP
-work             socks5://...:1080    Running         10.10.0.2
+work             socks5://...:1080    Running         10.203.240.2
 ```
 
 proxy-jail does **not** auto-forward ports.  You forward them yourself
@@ -209,21 +224,21 @@ exposed and *where* on the host they bind.
 ### From the host (loopback only)
 
 ```bash
-# Forward host 127.0.0.1:8000 → 10.10.0.2:8000
-socat TCP-LISTEN:8000,bind=127.0.0.1,fork,reuseaddr TCP:10.10.0.2:8000
+# Forward host 127.0.0.1:8000 → 10.203.240.2:8000
+socat TCP-LISTEN:8000,bind=127.0.0.1,fork,reuseaddr TCP:10.203.240.2:8000
 ```
 
 ### From the LAN (bind on all interfaces)
 
 ```bash
-socat TCP-LISTEN:8000,bind=0.0.0.0,fork,reuseaddr TCP:10.10.0.2:8000
+socat TCP-LISTEN:8000,bind=0.0.0.0,fork,reuseaddr TCP:10.203.240.2:8000
 ```
 
 ### From a remote host via SSH
 
 ```bash
 # Run on the *remote* machine — proxies through the host running proxy-jail
-ssh -L 8000:10.10.0.2:8000 user@proxy-jail-host
+ssh -L 8000:10.203.240.2:8000 user@proxy-jail-host
 ```
 
 ### Run a command inside the netns (most direct)
