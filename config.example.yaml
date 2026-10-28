@@ -32,6 +32,7 @@ jails:
 # Example usage:
 # 1. Create a jail:
 #    proxy-jail jail create work --socks5 127.0.0.1:1080
+#    proxy-jail jail create work --socks5 'socks5://user:pass@127.0.0.1:1080'
 #
 # 2. Run an application:
 #    proxy-jail app run work -- firefox

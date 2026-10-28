@@ -92,7 +92,16 @@ sudo cp tun2socks /usr/local/bin/
 
 ```bash
 proxy-jail jail create work --socks5 127.0.0.1:1080
+
+# Or use a SOCKS5 URI with username and password:
+proxy-jail jail create work --socks5 'socks5://user:password@127.0.0.1:1080'
 ```
+
+Percent-encode reserved characters in credentials (for example, `@` as `%40`
+and `:` as `%3A`). Credentials are saved in the configuration file and passed
+to `tun2socks` as a process argument; protect access to both. Command-line
+arguments may also be saved in your shell history. IPv6 proxy addresses are
+not currently supported.
 
 ### Run an application
 

@@ -221,13 +221,17 @@ impl ProxyConfig {
         format!("{}:{}", self.host, self.port)
     }
 
-    /// Get the SOCKS5 URL for tun2socks
-    #[allow(dead_code)]
-    pub fn socks5_url(&self) -> String {
-        match &self.auth {
-            Some(auth) => format!("socks5://{}:{}@{}:{}", auth.username, auth.password, self.host, self.port),
-            None => format!("socks5://{}:{}", self.host, self.port),
+    /// Build a SOCKS5 URL for tun2socks, encoding credential delimiters.
+    pub fn socks5_url(&self, host: &str) -> Result<String> {
+        let mut url = url::Url::parse(&format!("socks5://{}:{}", host, self.port))
+            .context("Invalid SOCKS5 proxy host")?;
+        if let Some(auth) = &self.auth {
+            url.set_username(&auth.username.replace('%', "%25"))
+                .expect("SOCKS5 URL supports a username");
+            url.set_password(Some(&auth.password.replace('%', "%25")))
+                .expect("SOCKS5 URL supports a password");
         }
+        Ok(url.into())
     }
 }
 

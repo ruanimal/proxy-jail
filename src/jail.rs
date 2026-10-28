@@ -16,12 +16,13 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
     info!("Creating jail: {}", name);
 
     // Parse socks5 address
-    let (host, port) = parse_socks5_addr(socks5_addr)?;
+    let mut proxy = parse_socks5_addr(socks5_addr)?;
+    let host = &proxy.host;
 
     // Inside a network namespace, 127.0.0.1 refers to the namespace's own
     // loopback — not the host's.  Rewrite to "gateway" so the YAML config
     // is unambiguous, and the actual IP is resolved at runtime.
-    let effective_host = if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+    let effective_host = if host == "localhost" || host == "127.0.0.1" {
         warn!(
             "Proxy host '{}' refers to the local machine, but inside the network \
              namespace this would point to the namespace's own loopback. \
@@ -32,18 +33,14 @@ pub fn create_jail(name: &str, socks5_addr: &str, config: &mut Config) -> Result
         );
         "gateway".to_string()
     } else {
-        host
+        host.clone()
     };
+    proxy.host = effective_host;
 
     // Create jail configuration
     let jail = JailConfig {
         name: name.to_string(),
-        proxy: crate::config::ProxyConfig {
-            host: effective_host,
-            port,
-            proxy_type: "socks5".to_string(),
-            auth: None,
-        },
+        proxy,
         subnet: None,
     };
 
@@ -673,19 +670,70 @@ fn acquire_lock(jail: &JailConfig) -> Result<Flock<File>> {
     }
 }
 
-/// Parse a SOCKS5 address string (host:port)
-fn parse_socks5_addr(addr: &str) -> Result<(String, u16)> {
-    let parts: Vec<&str> = addr.split(':').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Invalid SOCKS5 address format: {}. Expected host:port", addr);
+/// Parse a SOCKS5 address or URI without exposing credentials in errors.
+fn parse_socks5_addr(addr: &str) -> Result<crate::config::ProxyConfig> {
+    let uri = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("socks5://{addr}")
+    };
+    let parsed = url::Url::parse(&uri)
+        .map_err(|_| anyhow::anyhow!("Invalid SOCKS5 proxy address"))?;
+    if matches!(parsed.host(), Some(url::Host::Ipv6(_))) {
+        anyhow::bail!("IPv6 SOCKS5 proxy addresses are not supported");
+    }
+    if parsed.scheme() != "socks5"
+        || parsed.host_str().is_none()
+        || parsed.port().is_none()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("Expected a SOCKS5 proxy address with host and port, without path, query, or fragment");
     }
 
-    let host = parts[0].to_string();
-    let port: u16 = parts[1]
-        .parse()
-        .with_context(|| format!("Invalid port number: {}", parts[1]))?;
-
-    Ok((host, port))
+    let auth = if parsed.username().is_empty() && parsed.password().is_none() {
+        None
+    } else {
+        let password = parsed.password().ok_or_else(|| {
+            anyhow::anyhow!("SOCKS5 authentication requires a username and password")
+        })?;
+        let decode = |value: &str| -> Result<String> {
+            let bytes = value.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    if i + 2 >= bytes.len()
+                        || !bytes[i + 1].is_ascii_hexdigit()
+                        || !bytes[i + 2].is_ascii_hexdigit()
+                    {
+                        anyhow::bail!("Invalid percent encoding in SOCKS5 credentials");
+                    }
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .map_err(|_| anyhow::anyhow!("SOCKS5 credentials must be valid UTF-8"))?
+                .into_owned())
+        };
+        let username = decode(parsed.username())?;
+        if username.is_empty() {
+            anyhow::bail!("SOCKS5 authentication requires a username and password");
+        }
+        Some(crate::config::ProxyAuth {
+            username,
+            password: decode(password)?,
+        })
+    };
+    Ok(crate::config::ProxyConfig {
+        host: parsed.host_str().unwrap().to_string(),
+        port: parsed.port().unwrap(),
+        proxy_type: "socks5".to_string(),
+        auth,
+    })
 }
 
 #[cfg(test)]
@@ -695,16 +743,38 @@ mod tests {
 
     #[test]
     fn test_parse_socks5_addr() {
-        let (host, port) = parse_socks5_addr("127.0.0.1:1080").unwrap();
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 1080);
+        for addr in ["127.0.0.1:1080", "socks5://127.0.0.1:1080"] {
+            let proxy = parse_socks5_addr(addr).unwrap();
+            assert_eq!(proxy.host, "127.0.0.1");
+            assert_eq!(proxy.port, 1080);
+            assert!(proxy.auth.is_none());
+        }
+        let proxy =
+            parse_socks5_addr("socks5://user%40name:p%3Ass%2540@proxy.example.com:1080")
+                .unwrap();
+        assert_eq!(proxy.host, "proxy.example.com");
+        let config_yaml = serde_yaml::to_string(&proxy).unwrap();
+        let proxy: crate::config::ProxyConfig = serde_yaml::from_str(&config_yaml).unwrap();
+        let generated = proxy.socks5_url(&proxy.host).unwrap();
+        let roundtrip = parse_socks5_addr(&generated).unwrap();
+        let auth = roundtrip.auth.unwrap();
+        assert_eq!(auth.username, "user@name");
+        assert_eq!(auth.password, "p:ss%40");
 
-        let (host, port) = parse_socks5_addr("proxy.example.com:1080").unwrap();
-        assert_eq!(host, "proxy.example.com");
-        assert_eq!(port, 1080);
-
-        assert!(parse_socks5_addr("invalid").is_err());
-        assert!(parse_socks5_addr("host:99999").is_err());
+        for addr in [
+            "invalid",
+            "host:99999",
+            "http://host:1080",
+            "socks5://host:1080/path",
+            "socks5://host:1080?query",
+            "socks5://host:1080#fragment",
+            "socks5://user@host:1080",
+            "socks5://user:bad%zz@host:1080",
+            "socks5://user:%FF@host:1080",
+            "socks5://[::1]:1080",
+        ] {
+            assert!(parse_socks5_addr(addr).is_err(), "accepted {addr}");
+        }
     }
 
     fn fake_jail() -> JailConfig {

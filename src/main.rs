@@ -49,7 +49,7 @@ enum JailCommands {
     Create {
         /// Jail name
         name: String,
-        /// SOCKS5 proxy address (host:port)
+        /// SOCKS5 proxy address (host:port or socks5://[username:password@]host:port)
         #[arg(long)]
         socks5: String,
     },

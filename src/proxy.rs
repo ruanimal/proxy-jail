@@ -49,13 +49,12 @@ pub fn start_tun2socks(jail: &JailConfig, subnet: &str) -> Result<u32> {
         jail.proxy.host.clone()
     };
 
-    // Build proxy URL
-    let proxy_url = match &jail.proxy.auth {
-        Some(auth) => format!("socks5://{}:{}@{}:{}", auth.username, auth.password, effective_proxy_host, jail.proxy.port),
-        None => format!("socks5://{}:{}", effective_proxy_host, jail.proxy.port),
-    };
-
-    info!("Starting tun2socks in namespace: {} -> {}", netns_name, proxy_url);
+    // Keep credentials out of the startup log.
+    let proxy_url = jail.proxy.socks5_url(&effective_proxy_host)?;
+    info!(
+        "Starting tun2socks in namespace: {} -> {}:{}",
+        netns_name, effective_proxy_host, jail.proxy.port
+    );
 
     // Spawn tun2socks via `ip netns exec` (we are already root after the
     // top-level `sudo` re-exec in `main.rs`, so no nested `sudo` is
