@@ -13,7 +13,7 @@ mod proxy;
 /// Proxy Jail - Force GUI applications through SOCKS5 proxy using network namespaces
 #[derive(Parser)]
 #[command(name = "proxy-jail")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Force GUI applications through SOCKS5 proxy using network namespaces")]
 struct Cli {
     /// Verbosity level (-v, -vv, -vvv)
