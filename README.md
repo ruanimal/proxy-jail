@@ -199,6 +199,13 @@ Desktop entries are owned by the invoking user. To fix an existing entry
 created by an older version as root, run the same `desktop create` command
 again for that entry.
 
+Generated entries never inherit `NoDisplay` or `Hidden` from the source file.
+Vendors use those flags to hide one of several entries they ship (Google Chrome
+installs both `google-chrome.desktop` and a hidden `com.google.Chrome.desktop`),
+and copying the flag would keep the new `pj-<jail>-...desktop` entry out of the
+application menu. Entries written by older versions may still contain the flag;
+re-run `desktop create` for them after upgrading.
+
 After creating or deleting an entry, proxy-jail refreshes the user applications
 database with `update-desktop-database`. In KDE sessions it also rebuilds the
 application menu cache with `kbuildsycoca6 --noincremental` or the KDE 5

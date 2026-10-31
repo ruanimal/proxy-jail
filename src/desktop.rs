@@ -128,6 +128,13 @@ fn parse_desktop_file(path: &Path) -> Result<HashMap<String, String>> {
 /// the fields that need to change (Name, Exec, Comment) and preserving everything
 /// else — including [Desktop Action ...] sections, localized strings, Keywords,
 /// StartupNotify, and any future fields the application may add.
+///
+/// `NoDisplay` and `Hidden` are dropped instead of being inherited. They hide
+/// the entry the vendor chose to hide (for example Google Chrome ships
+/// `com.google.Chrome.desktop` with `NoDisplay=true` so it does not duplicate
+/// `google-chrome.desktop` in menus), but the generated entry has its own
+/// desktop file ID (`pj-<jail>-<app>.desktop`), so inheriting the flag would
+/// only make the jail entry invisible with nothing to deduplicate.
 fn transform_desktop_content(
     original_content: &str,
     jail_name: &str,
@@ -167,6 +174,9 @@ fn transform_desktop_content(
         if in_desktop_entry {
             if let Some((key, value)) = trimmed.split_once('=') {
                 match key {
+                    // See the function docs: hide flags belong to the source
+                    // entry, not to the generated one.
+                    "NoDisplay" | "Hidden" => continue,
                     "Name" if !key.contains('[') => {
                         // Main Name field — append jail tag
                         output.push_str(&format!("Name={} (jail: {})\n", value, jail_name));
@@ -270,7 +280,8 @@ fn write_desktop_file(path: &Path, content: &str, owner: (Uid, Gid)) -> Result<(
 /// Install a .desktop file for an application in a jail, directly from a .desktop file path
 /// Uses a line-by-line transform approach: only modifies Name, Exec, and Comment,
 /// preserving all other fields, sections (including [Desktop Action ...]), and
-/// localized strings from the original file.
+/// localized strings from the original file. `NoDisplay`/`Hidden` are removed so
+/// the generated entry stays visible in application menus.
 pub fn desktop_install_from_file(jail: &JailConfig, desktop_path: &str) -> Result<()> {
     crate::config::parse_jail_name(&jail.name).map_err(anyhow::Error::msg)?;
     let source_path = find_desktop_file(desktop_path)?;
@@ -490,6 +501,51 @@ Categories=Network;WebBrowser;
 
         // Clean up
         fs::remove_file(&temp_file).unwrap();
+    }
+
+    #[test]
+    fn test_transform_drops_hidden_flags() {
+        // Mirrors /usr/share/applications/com.google.Chrome.desktop, whose only
+        // difference from google-chrome.desktop is NoDisplay=true.
+        let content = "\
+[Desktop Entry]
+Name=Google Chrome
+Exec=/usr/bin/google-chrome-stable %U
+Icon=google-chrome
+NoDisplay=true
+Hidden=true
+Type=Application
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/usr/bin/google-chrome-stable
+";
+        let source = Path::new("/usr/share/applications/com.google.Chrome.desktop");
+        let result = transform_desktop_content(content, "pp", source);
+
+        assert!(!result.contains("NoDisplay="));
+        assert!(!result.contains("Hidden="));
+
+        // Everything else still passes through unchanged.
+        assert!(result.contains("Name=Google Chrome (jail: pp)\n"));
+        assert!(
+            result.contains(
+                "Exec=proxy-jail app exec --jail pp -- /usr/bin/google-chrome-stable %U\n"
+            )
+        );
+        assert!(result.contains("Icon=google-chrome\n"));
+        assert!(result.contains("Actions=new-window;\n"));
+        assert!(result.contains("X-Proxy-Jail=pp\n"));
+        assert!(
+            result.contains(
+                "X-Proxy-Jail-Original=/usr/share/applications/com.google.Chrome.desktop\n"
+            )
+        );
+        assert!(
+            result
+                .contains("Exec=proxy-jail app exec --jail pp -- /usr/bin/google-chrome-stable\n")
+        );
     }
 
     #[test]
